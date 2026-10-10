@@ -1,0 +1,34 @@
+# Build
+*.o
+*.exe
+*.res
+dist/
+milthm-player.exe
+milthm_player.cpp.o
+
+# Debug
+milthm_debug.txt
+line_debug.txt
+
+# Temp charts
+chart_*.json
+
+# IDE
+.codely/
+.codely-cli/
+.workbuddy/
+
+# Test outputs
+files/test/tmp/
+
+# Logs
+*.log
+
+# Resources (textures / fonts / hitsounds) - never upload
+files/resources/
+_line_extract.png
+# Promo video assets (mp4 + font)
+promo_video/
+# Archives
+*.rar
+_line_extract.png

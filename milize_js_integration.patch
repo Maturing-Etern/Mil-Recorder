@@ -1,0 +1,249 @@
+diff --git a/README.md b/README.md
+index 9231149..ad54a17 100644
+--- a/README.md
++++ b/README.md
+@@ -84,15 +84,9 @@ easy-phi/
+ 
+ `files/resources/` 下的资源文件版权归原作者所有，如有侵权请联系删除。
+ 
+-## 内嵌 Milize JS 引擎（官方 JS 谱面直读）
++## 关于官方 JS 谱面
+ 
+-`milize_js/` 模块内嵌 **quickjs**，`MilWindow::loadChart` 自动检测官方 JS 谱面（含 `MilizeBeatmap`）→ 引擎执行 → **直接构造 MilChart 内存模型** → 渲染（**免外部 Python 转换、免 DevJson/临时文件、免先转 fmt2**）。
++官方 Milthm 谱面（`MilizeBeatmap` JS 格式）需要一个内嵌的 JS 引擎（quickjs）来直接执行。
++本版本**未编译该引擎**，加载官方 JS 谱面会直接报错退出。
+ 
+-- 支持：`t()/n()/a()/m.line()/m.storyboardObject()/p()/withProperty()` 全部官方 API（与 libMilize.so 同构，加载时执行一次，渲染走原生 BeatmapModel）
+-- Color 动画：数字（r<<24|g<<16|b<<8|a）与 oklch() 均支持
+-- 覆盖率：373/381 官方谱面直接执行（8 首为压缩版/特效配置，预期跳过）
+-- `build.bat` 自动编译 quickjs（需 GCC，已配置）
+-
+-```
+-官方 JS 谱面 → milize_js (quickjs) → Builder → MilChart（内存）→ easy-phi 渲染（零改动）
+-```
++请先将谱面转换为 DevJson / fmt2 格式再使用。
+diff --git a/build.bat b/build.bat
+index 0654c61..f92b5d9 100644
+--- a/build.bat
++++ b/build.bat
+@@ -61,18 +61,6 @@ echo [PATCH] Applying GCC 13 compatibility fixes...
+ python "%~dp0patch_gcc13.py" "%SOURCE%"
+ if not exist "%PATCHED%" set SRC=%SOURCE%
+ 
+-:: Step 2.2: Milize JS engine compatibility fixes (gassert::asrt / shadow)
+-python "%~dp0patch_milize_compat.py" "%PATCHED%"
+-
+-:: Step 2.5: Build Milize JS engine as static library (libmilize_js.a)
+-set MILIZE_DIR=%~dp0milize_js
+-if not exist "%MILIZE_DIR%\libmilize_js.a" (
+-    echo [MILIZE] Building milize_js static library...
+-    call "%MILIZE_DIR%\build_lib.bat" < nul
+-    if errorlevel 1 ( echo [ERROR] milize_js library build failed & pause & exit /b 1 )
+-)
+-echo [OK] Milize JS engine: libmilize_js.a
+-
+ :: Step 3: Compile
+ echo.
+ echo [COMPILE] Starting compilation (this may take a few minutes)...
+@@ -84,7 +72,6 @@ set INCS=%INCS% -IE:\grain_data\packages\gvorbis==0\.grain\includes
+ set INCS=%INCS% -IE:\grain_data\packages\gminiaudio==0\.grain\includes
+ set INCS=%INCS% -IE:\grain_data\packages\gvideoenc==0\.grain\includes
+ set INCS=%INCS% -IE:\grain_data\packages\gtext_renderer==0\.grain\includes
+-set INCS=%INCS% -I%MILIZE_DIR%
+ 
+ set LIBS=E:\grain_data\packages\gglfw3==0\.grain\libs\libglfw3_windows_x86_64.a
+ set LIBS=%LIBS% E:\grain_data\packages\gimage==0\.grain\libs\libstb_image_windows_x86_64.a
+@@ -100,7 +87,7 @@ set LIBS=%LIBS% E:\grain_data\packages\gtext_renderer==0\.grain\libs\libstb_true
+ set LFLAGS=-lbcrypt -luuid -lole32 -lcomctl32 -lopengl32 -lgdi32 -lws2_32
+ 
+ echo [BUILD] Using source: %SRC%
+-"%GCC%" -std=c++20 -static -O1 -Wsign-compare -Wa,-mbig-obj -include "%MILIZE_DIR%\milize_js.h" %INCS% "%SRC%" "%MILIZE_DIR%\libmilize_js.a" %LIBS% %LFLAGS% -o "%OUTPUT%"
++"%GCC%" -std=c++20 -static -O1 -Wsign-compare -Wa,-mbig-obj %INCS% "%SRC%" %LIBS% %LFLAGS% -o "%OUTPUT%"
+ 
+ echo.
+ if exist "%OUTPUT%" (
+diff --git a/build_mil.sh b/build_mil.sh
+index 838b287..42e196a 100644
+--- a/build_mil.sh
++++ b/build_mil.sh
+@@ -13,21 +13,18 @@ mkdir -p "E:/grain_data/build/tmp"
+ 
+ "E:/Qt/Tools/mingw1310_64/bin/g++.exe" \
+   -std=c++20 -static -O1 -Wsign-compare -Wa,-mbig-obj -pipe \
+-  -include "$ROOT/milize_js/milize_js.h" \
+   -I"$G/gglfw3==0/.grain/includes" \
+   -I"$G/gimage==0/.grain/includes" \
+   -I"$G/gvorbis==0/.grain/includes" \
+   -I"$G/gminiaudio==0/.grain/includes" \
+   -I"$G/gvideoenc==0/.grain/includes" \
+   -I"$G/gtext_renderer==0/.grain/includes" \
+-  -I"$ROOT/milize_js" \
+   -I"$ROOT/external/miniz" \
+   "$SRC" \
+   "$ROOT/external/miniz/miniz.c" \
+   "$ROOT/external/miniz/miniz_tinfl.c" \
+   "$ROOT/external/miniz/miniz_tdef.c" \
+   "$ROOT/external/miniz/miniz_zip.c" \
+-  "$ROOT/milize_js/libmilize_js.a" \
+   "$G/gglfw3==0/.grain/libs/libglfw3_windows_x86_64.a" \
+   "$G/gimage==0/.grain/libs/libstb_image_windows_x86_64.a" \
+   "$G/gvorbis==0/.grain/libs/libstb_vorbis_windows_x86_64.a" \
+diff --git a/files/test/main.cpp b/files/test/main.cpp
+index 75d5edf..8ce2749 100644
+--- a/files/test/main.cpp
++++ b/files/test/main.cpp
+@@ -1,6 +1,4 @@
+ namespace test_main {
+-    // 内嵌 Milize JS 引擎（milize_js.hpp 由 build.bat 以 -include 注入）：官方 JS 谱面 → Builder → MilChart
+-
+     using gframerate_meter::FramerateMeter;
+     using gregapi::RegAPI;
+     using gdata::Data;
+@@ -237,124 +235,6 @@ namespace test_main {
+         }
+     };
+ 
+-    // ============ Milize JS → MilChart 直接构造（免 JSON/文件往返） ============
+-    // oklch(L C H) → sRGB 0-255（CSS Color 4 标准公式）
+-    static void oklchToRgb(const std::string& s, double& r, double& g, double& b) {
+-        r = g = b = 0;
+-        size_t lp = s.find('('), rp = s.find(')');
+-        if (lp == std::string::npos || rp == std::string::npos) return;
+-        std::string body = s.substr(lp + 1, rp - lp - 1);
+-        std::string parts[3]; int pi = 0;
+-        std::string cur;
+-        for (char c : body) {
+-            if (c == ' ' || c == ',' || c == '/') {
+-                if (!cur.empty() && pi < 3) { parts[pi++] = cur; cur.clear(); }
+-            } else cur += c;
+-        }
+-        if (!cur.empty() && pi < 3) parts[pi++] = cur;
+-        if (pi < 3) return;
+-        double L = atof(parts[0].c_str()), C = atof(parts[1].c_str()), H = atof(parts[2].c_str());
+-        const double PI = 3.14159265358979323846;
+-        double a_ = C * std::cos(H * PI / 180.0), b_ = C * std::sin(H * PI / 180.0);
+-        double l_ = L + 0.3963377774 * a_ + 0.2158037573 * b_;
+-        double m_ = L - 0.1055613458 * a_ - 0.0638541728 * b_;
+-        double s_ = L - 0.0894841775 * a_ - 1.2914855480 * b_;
+-        double l3 = l_ * l_ * l_, m3 = m_ * m_ * m_, s3 = s_ * s_ * s_;
+-        double rr = 4.0767416621 * l3 - 3.3077115913 * m3 + 0.2309699292 * s3;
+-        double gg = -1.2684380046 * l3 + 2.6097574011 * m3 - 0.3413193965 * s3;
+-        double bb = -0.0041960863 * l3 - 0.7034186147 * m3 + 1.7076147010 * s3;
+-        auto gamma = [](double c) { return c <= 0.0031308 ? 12.92 * c : 1.055 * std::pow(c, 1.0 / 2.4) - 0.055; };
+-        r = gamma(rr) * 255.0; g = gamma(gg) * 255.0; b = gamma(bb) * 255.0;
+-    }
+-
+-    static Color parseMilColor(const std::string& s) {
+-        if (s.empty()) return Color::White();
+-        // 数字: r<<24 | g<<16 | b<<8 | a
+-        bool allDigits = !s.empty();
+-        for (char c : s) if (c < '0' || c > '9') { allDigits = false; break; }
+-        if (allDigits) {
+-            try {
+-                uint64 v = std::stoull(s);
+-                double r = ((v >> 24) & 0xFF), g = ((v >> 16) & 0xFF), b = ((v >> 8) & 0xFF), a = (v & 0xFF);
+-                return Color{ r / 255.0, g / 255.0, b / 255.0, a / 255.0 };
+-            } catch (...) {}
+-        }
+-        // oklch(...)
+-        if (s.rfind("oklch", 0) == 0) {
+-            double r, g, b;
+-            oklchToRgb(s, r, g, b);
+-            return Color{ r / 255.0, g / 255.0, b / 255.0, 1.0 };
+-        }
+-        // CSS (#hex / rgb / hsl)
+-        try { return Color::FromCss(s); } catch (...) {}
+-        return Color::White();
+-    }
+-
+-    geasy_phi::MilChart buildMilChartFromBuilder(const milize_js::Builder& b) {
+-        using namespace geasy_phi;
+-        MilChart chart {};
+-        chart.meta.noteFlowSpeedBehavior = MilMeta::NoteFlowSpeedBehavior::Override;
+-        chart.meta.worldOrigin = { (float64)-1920 / 2, (float64)1080 / 2 };
+-        chart.meta.worldViewport = { 1920, -1080 };
+-        chart.meta.speedUnit = 108.0;
+-        auto mget = [&](const char* k) -> std::string {
+-            auto it = b.meta.find(k);
+-            return it == b.meta.end() ? "" : it->second;
+-        };
+-        chart.meta.title = mget("Title");
+-        chart.meta.composer = mget("Composer");
+-        chart.meta.artist = mget("Illustrator");
+-        chart.meta.charter = mget("Beatmapper");
+-        chart.meta.difficultyName = mget("Difficulty");
+-        chart.meta.difficultyValue = b.hasDifficultyValue ? atof(mget("DifficultyValue").c_str()) : 0.0;
+-
+-        // lines（含 m.line() 空线占位）
+-        uint64 lineIdx = 0;
+-        for (auto& bn : b.lines) {
+-            auto& line = chart.lines.emplace_back();
+-            line.indexer.set(chart.animator.indexGen.get({ EnumMilObjectType::Line, lineIdx++ }));
+-            for (auto& n : bn) {
+-                auto& note = line.notes.emplace_back();
+-                note.indexer.set(chart.animator.indexGen.get({ EnumMilObjectType::Note, n.index }));
+-                note.type = MilNoteTypeHelper::FromInt(n.type);
+-                note.timeZone = { n.startTime, n.endTime };
+-                note.isFake = n.isFake;
+-                note.isAlwaysPerfect = n.isAlwaysPerfect;
+-            }
+-        }
+-
+-        // storyboard
+-        uint64 sbIdx = 0;
+-        for (auto& s : b.storyboard) {
+-            auto& sb = chart.storyboardObjects.emplace_back();
+-            sb.indexer.set(chart.animator.indexGen.get({ EnumMilObjectType::Storyboard, sbIdx++ }));
+-            sb.type = MilStoryboardTypeHelper::FromInt(s.type);
+-            sb.data = s.data;
+-            sb.layer = MilStoryboardLayerHelper::FromInt(s.layer);
+-        }
+-
+-        // animations → animator（与 loadMilChartFromDevJson 同构）
+-        uint64 eventIdx = 0;
+-        for (auto& a : b.anims) {
+-            MilEvent e {};
+-            e.index = eventIdx++;
+-            e.type = MilEventTypeHelper::FromInt(a.key);
+-            e.timeZone = { a.fromBeat, a.toBeat };
+-            if (e.type == EnumMilEventType::Color) {
+-                e.valueZone = chart.storyboardAssets.requestColorPair(parseMilColor(a.fvStr), parseMilColor(a.tvStr));
+-            } else {
+-                e.valueZone = { a.fv, a.tv };
+-            }
+-            if (a.press != 0) {
+-                e.easingFuncContext = (void*)EaseSet::Milthm::pack(a.ease, a.press);
+-                e.easingFunc = [](void* c, float64 p) { auto [x, y] = EaseSet::Milthm::unpack((uint64)c); return EaseSet::Milthm::easing(x, y, p); };
+-                e.easingIntFunc = [](void* c, float64 p) { auto [x, y] = EaseSet::Milthm::unpack((uint64)c); return EaseSet::Milthm::easing_int(x, y, p); };
+-            }
+-            chart.animator.addEvent({ MilObjectTypeHelper::FromInt(a.data), a.i1 }, e);
+-        }
+-        return chart;
+-    }
+-
+     struct MilWindow {
+         WindowBase base;
+ 
+@@ -394,19 +274,11 @@ namespace test_main {
+             auto fileData = Data::MakeFromFile(path);
+             std::string text = fileData.toString();
+ 
+-            // [Milize JS] 检测官方 JS 谱面(MilizeBeatmap)→ 内嵌 quickjs 执行 → 直接构造 MilChart
++            // 官方 JS 谱面(MilizeBeatmap)需要内嵌 Milize JS 引擎, 本版本未编译该引擎
+             if (text.find("MilizeBeatmap") != std::string::npos) {
+-                std::string err;
+-                auto builder = milize_js::ExecuteToBuilder(text, &err);
+-                if (err.empty() && !builder.bpms.empty()) {
+-                    std::printf("[Milize] 官方 JS 谱面由内嵌引擎直接解析: %s\n", path.c_str());
+-                    auto initer = [](MilChart& c) { c.init(); };
+-                    return renderer->loadChartFromMilChart(buildMilChartFromBuilder(builder), initer);
+-                }
+-                // JS 谱面 quickjs 执行失败:不要把 JS 文本塞给 JSON parser(必失败且误导)
+                 throw std::runtime_error(
+-                    "JS 谱面解析失败: " + (err.empty() ? "执行未报错但 builder.bpms 为空(可能是空谱面)" : err)
+-                    + "\n文件: " + path
++                    "官方 JS 谱面(MilizeBeatmap)需要内嵌 Milize JS 引擎, 本版本未编译。\n"
++                    "请先把谱面转成 DevJson / fmt2, 或使用含 milize_js 的版本。\n文件: " + path
+                 );
+             }
+ 
