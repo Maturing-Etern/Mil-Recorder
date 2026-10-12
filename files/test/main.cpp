@@ -1411,7 +1411,11 @@ namespace test_main {
             backendWin.base.window->setSwapInterval(0);
             backendWin.base.surfaceSize = { (uint64)W, (uint64)H };
             backendWin.loadChart(chartPath, chartDir);
-            if (!imagePath.empty()) backendWin.renderer->loadIllustion(imagePath);
+            if (!imagePath.empty()) {
+                try { backendWin.renderer->loadIllustion(imagePath); }
+                catch (const std::exception& e) { std::fprintf(stderr, "[dbg record] jacket decode failed (%s), fallback to mask\n", e.what()); }
+                catch (...) { std::fprintf(stderr, "[dbg record] jacket decode failed, fallback to mask\n"); }
+            }
             backendWin.renderer->audioManager.load(audioPath);
             std::fprintf(stderr, "[dbg record] loadChart ok, songLength=%.2fs\n", backendWin.renderer->audioManager.getBgmLength());
 
@@ -1522,6 +1526,17 @@ namespace test_main {
             auto slash = chartPath.find_last_of("\\/");
             if (slash != std::string::npos) chartDir = chartPath.substr(0, slash);
 
+            std::string imagePath;
+            std::string effChart = chartPath;
+            {
+                std::string lower = effChart;
+                for (auto& c : lower) c = (char)std::tolower((unsigned char)c);
+                if (lower.size() >= 4 && lower.rfind(".zip") == lower.size() - 4) {
+                    auto r = resolveMilZip(effChart);
+                    effChart = r.chart; chartDir = r.dir; imagePath = r.image;
+                }
+            }
+
             MilWindow backendWin {};
             std::fprintf(stderr, "[dbg screenshot] constructed\n");
             backendWin.init(true);
@@ -1532,7 +1547,25 @@ namespace test_main {
 
             backendWin.base.surfaceSize = { (uint64)W, (uint64)H };
 
-            auto info = backendWin.loadChart(chartPath, chartDir);
+            auto info = backendWin.loadChart(effChart, chartDir);
+            if (imagePath.empty()) {
+                auto metaData = Data::MakeFromFileOptional(chartDir.empty() ? "meta.json" : chartDir + "/meta.json");
+                if (metaData) {
+                    try {
+                        auto metaRoot = JsonNode::Parse(*metaData);
+                        if (metaRoot.isObject() && metaRoot.hasKey("image_file") && metaRoot["image_file"].isString()) {
+                            imagePath = metaRoot["image_file"].getString();
+                            if (!chartDir.empty() && imagePath.find('/') == std::string::npos && imagePath.find('\\') == std::string::npos)
+                                imagePath = chartDir + "/" + imagePath;
+                        }
+                    } catch (...) {}
+                }
+            }
+            if (!imagePath.empty()) {
+                try { backendWin.renderer->loadIllustion(imagePath); }
+                catch (const std::exception& e) { std::fprintf(stderr, "[dbg screenshot] jacket decode failed (%s), fallback to mask\n", e.what()); }
+                catch (...) { std::fprintf(stderr, "[dbg screenshot] jacket decode failed, fallback to mask\n"); }
+            }
             std::fprintf(stderr, "[dbg screenshot] loadChart ok: %d ms\n", (int)(info.createObjectTook * 1000));
 
             using FrameType = std::optional<uint64>;
