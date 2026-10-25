@@ -119,13 +119,33 @@ static double argToNum(JSContext* ctx, JSValueConst v, bool has) {
     return d;
 }
 
-static void js_property(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
-    if (argc < 2) return;
+// 返回全局 MilizeBeatmap 对象（新引用）
+static JSValue js_self(JSContext* ctx) {
+    JSValue g = JS_GetGlobalObject(ctx);
+    JSValue m = JS_GetPropertyStr(ctx, g, "MilizeBeatmap");
+    JS_FreeValue(ctx, g);
+    return m;
+}
+
+// p/withProperty 链式：返回 MilizeBeatmap 实例本身（milplay 口径：无限链、链上可用全部 API）
+static JSValue js_property(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    if (argc < 2) return JS_UNDEFINED;
     const char* k = JS_ToCString(ctx, argv[0]);
     const char* v = JS_ToCString(ctx, argv[1]);
     if (k && v) g_builder.setMeta(k, v);
     if (k) JS_FreeCString(ctx, k);
     if (v) JS_FreeCString(ctx, v);
+    return JS_UNDEFINED;
+}
+
+static JSValue js_p(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    js_property(ctx, this_val, argc, argv);
+    return js_self(ctx);
+}
+
+static JSValue js_with_property(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    js_property(ctx, this_val, argc, argv);
+    return js_self(ctx);
 }
 
 // ============ 时间参数解包(数字=秒 / 数组=拍时间戳) ============
@@ -202,7 +222,8 @@ static JSValue js_note(JSContext* ctx, JSValueConst, int argc, JSValueConst* arg
     if (argc > 6) n.isAlwaysPerfect = JS_ToBool(ctx, argv[6]) == 1;
     g_builder.ensureLine((uint64_t)line);
     g_builder.lines[(uint64_t)line].push_back(n);
-    return JS_UNDEFINED;
+    // 本家 BeatmapAddNote -> ulong id（全局创建序）；谱面 var q=n(...) 会把 id 传给 animation 的 i1
+    return JS_NewInt64(ctx, (int64_t)n.index);
 }
 
 static JSValue js_animation(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
@@ -228,7 +249,8 @@ static JSValue js_animation(JSContext* ctx, JSValueConst, int argc, JSValueConst
     }
     if (a.data == 0 && a.i1 < 100000) g_builder.ensureLine(a.i1);  // 线动画 → 保证线存在（防爆）
     g_builder.anims.push_back(a);
-    return JS_UNDEFINED;
+    // 本家 BeatmapAddAnimation -> ulong id
+    return JS_NewInt64(ctx, (int64_t)(g_builder.anims.size() - 1));
 }
 
 static JSValue js_line(JSContext* ctx, JSValueConst, int, JSValueConst*) {
@@ -250,22 +272,8 @@ static JSValue js_storyboard(JSContext* ctx, JSValueConst, int argc, JSValueCons
     if (argc > 2) JS_ToFloat64(ctx, &layer, argv[2]);
     sb.type = (uint64_t)type; sb.layer = (uint64_t)layer;
     g_builder.storyboard.push_back(sb);
-    return JS_UNDEFINED;
-}
-
-// p/withProperty 都返回带 .p 的新对象，支持无限链式
-static JSValue js_p(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
-    js_property(ctx, this_val, argc, argv);
-    JSValue obj = JS_NewObject(ctx);
-    JS_SetPropertyStr(ctx, obj, "p", JS_NewCFunction(ctx, js_p, "p", 2));
-    return obj;
-}
-
-static JSValue js_with_property(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
-    js_property(ctx, this_val, argc, argv);
-    JSValue obj = JS_NewObject(ctx);
-    JS_SetPropertyStr(ctx, obj, "p", JS_NewCFunction(ctx, js_p, "p", 2));
-    return obj;
+    // 本家 BeatmapAddStoryboardObject -> ulong id；谱面可能保存该 id 回传
+    return JS_NewInt64(ctx, (int64_t)(g_builder.storyboard.size() - 1));
 }
 
 // withoutProperty: 从 meta 删除键（与 withProperty 配对）
@@ -276,16 +284,79 @@ static JSValue js_without_property(JSContext* ctx, JSValueConst, int argc, JSVal
     return JS_UNDEFINED;
 }
 
-// env: 谱面初始化上下文（noop；保留接口兼容）
-static JSValue js_env(JSContext*, JSValueConst, int, JSValueConst*) {
-    return JS_UNDEFINED;
+// env(key) -> 字符串环境值；milplay 口径（stage=CSS 尺寸，这里取常量 1920x1080）
+static JSValue js_env(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    if (argc < 1) return JS_NewString(ctx, "");
+    const char* k = JS_ToCString(ctx, argv[0]);
+    if (!k) return JS_NewString(ctx, "");
+    static const std::map<std::string, std::string> envTbl = {
+        {"stage.width", "1920"}, {"stage.height", "1080"},
+        {"system.screen_width", "1920"}, {"system.screen_height", "1080"},
+        {"user.note_scale", "1"}, {"user.flow_speed", "1"},
+        {"user.name", ""}, {"user.nickname", ""},
+        {"user.culture.bcp47", "en"}, {"user.culture.ieft_label", "en"},
+        {"user.culture.ietf_label", "en"}, {"user.culture.language", "en"},
+        {"user.culture.region", "US"}, {"user.culture.script", "Latn"},
+        {"time", "0"},
+    };
+    auto it = envTbl.find(k);
+    JS_FreeCString(ctx, k);
+    return JS_NewString(ctx, it != envTbl.end() ? it->second.c_str() : "");
 }
+
+// ============ 全局面 prelude（对齐 milplay js/core/base.js:742-792，382/382 实证）============
+// 所有别名/辅助函数/枚举用 var 声明在全局 —— 谱面可重声明（打包谱面 var L=MilizeBeatmap,ul=L.timing 等）。
+// 方法从 MilizeBeatmap 对象取出（C 函数无 this 依赖），解绑保存后单独调用仍正确。
+static const char kMilizePrelude[] = R"JS(
+var __mil = globalThis.MilizeBeatmap;
+globalThis.m = __mil;
+globalThis.timing = __mil.timing; globalThis.line = __mil.line; globalThis.note = __mil.note;
+globalThis.animation = __mil.animation; globalThis.storyboardObject = __mil.storyboardObject;
+globalThis.withProperty = __mil.withProperty; globalThis.withoutProperty = __mil.withoutProperty;
+globalThis.env = __mil.env;
+var m = __mil, p = __mil.withProperty, t = __mil.timing, n = __mil.note, X = __mil.note,
+    s = __mil.storyboardObject, a = __mil.animation,
+    timing = __mil.timing, line = __mil.line, note = __mil.note, animation = __mil.animation,
+    storyboardObject = __mil.storyboardObject, withProperty = __mil.withProperty,
+    withoutProperty = __mil.withoutProperty, env = __mil.env;
+var tap = function(l,b,tm){return n(l,b,tm,tm,0,false,false)};
+var fakeTap = function(l,b,tm){return n(l,b,tm,tm,0,true,false)};
+var exTap = function(l,b,tm){return n(l,b,tm,tm,0,false,true)};
+var drag = function(l,b,tm){return n(l,b,tm,tm,1,false,false)};
+var fakeDrag = function(l,b,tm){return n(l,b,tm,tm,1,true,false)};
+var fracture = function(l,b,tm){return n(l,b,tm,tm,2,false,false)};
+var hold = function(l,b,st,en){return n(l,b,st,en,0,false,false)};
+var fakeHold = function(l,b,st,en){return n(l,b,st,en,0,true,false)};
+var exHold = function(l,b,st,en){return n(l,b,st,en,0,false,true)};
+class NoteType extends Number{} class AnimationType extends Number{}
+class AnimationBindingType extends Number{} class EaseType extends Number{}
+class EaseSubType extends Number{} class StoryboardObjectType extends Number{}
+class StoryboardObjectLayerType extends Number{}
+var NoteTypeEnum = Object.freeze({tap:0,hold:0,drag:1,fracture:2});
+var AnimationTypeEnum = Object.freeze({PositionX:0,PositionY:1,Transparency:2,Size:3,Rotation:4,FlowSpeed:5,RelativeX:6,RelativeY:7,LineBodyTransparency:8,LineHeadTransparency:9,StoryBoardWidth:10,StoryBoardHeight:11,Speed:12,WholeTransparency:13,SBLBX:14,SBLBY:15,SBRBX:16,SBRBY:17,SBLTX:18,SBLTY:19,SBRTX:20,SBRTY:21,Color:22,VisibleArea:23,RenderDistance:23});
+var AnimationBindingTypeEnum = Object.freeze({Line:0,Note:1,Storyboard:2});
+var EaseTypeEnum = Object.freeze({Linear:0,Sine:1,Quad:2,Cubic:3,Quart:4,Quint:5,Expo:6,Circ:7,Back:8,Elastic:9,Bounce:10,Bezier:11,Custom:12,Smoothstep:13,Sqrt:14,QuartRoot:15});
+var EaseSubTypeEnum = Object.freeze({In:0,Out:1,IO:2});
+var StoryboardObjectTypeEnum = Object.freeze({Picture:0,Text:1});
+var StoryboardObjectLayerEnum = Object.freeze({Background:0,Normal:1,Foreground:2});
+globalThis.NoteTypeEnum = NoteTypeEnum; globalThis.AnimationTypeEnum = AnimationTypeEnum;
+globalThis.AnimationBindingTypeEnum = AnimationBindingTypeEnum; globalThis.EaseTypeEnum = EaseTypeEnum;
+globalThis.EaseSubTypeEnum = EaseSubTypeEnum; globalThis.StoryboardObjectTypeEnum = StoryboardObjectTypeEnum;
+globalThis.StoryboardObjectLayerEnum = StoryboardObjectLayerEnum;
+function __milPreprocess(src){
+  return src
+    .replace(/^\s*import(?:[\s\S]*?\s+from\s*)?["'][^"']+["']\s*;?/gm,'')
+    .replace(/^\s*export\s*\{[^}]*\}\s*;?\s*$/gm,'')
+    .replace(/\bexport\s+default\s+/g,'')
+    .replace(/\bexport\s+(?=(?:const|let|var|function|class)\b)/g,'');
+}
+)JS";
 
 // ============ 执行入口 ============
 // 中断处理器：防止谱面 JS 死循环导致内存无界增长（OOM）
 static int js_interrupt_handler(JSRuntime*, void* opaque) {
     auto* start = (std::chrono::steady_clock::time_point*)opaque;
-    if (std::chrono::steady_clock::now() - *start > std::chrono::seconds(30)) return 1;
+    if (std::chrono::steady_clock::now() - *start > std::chrono::seconds(60)) return 1;
     return 0;
 }
 
@@ -338,7 +409,41 @@ static Builder ExecuteToBuilderImpl(const std::string& js, std::string* err) {
     JS_SetPropertyStr(ctx, g, "MilizeBeatmap", m);
     JS_FreeValue(ctx, g);
 
-    JSValue r = JS_Eval(ctx, js.c_str(), js.size(), "<chart>", 0);
+    // 1) prelude：铺全局面（别名/辅助/枚举/预处理函数）
+    JSValue pre = JS_Eval(ctx, kMilizePrelude, sizeof(kMilizePrelude) - 1, "<prelude>", 0);
+    if (JS_IsException(pre)) {
+        if (err) *err = "prelude eval failed";
+        JS_FreeValue(ctx, pre);
+        JS_FreeContext(ctx); JS_FreeRuntime(rt);
+        g_builder = Builder{};
+        return g_builder;
+    }
+    JS_FreeValue(ctx, pre);
+
+    // 2) 预处理：剥 import/export（milplay 同款规则，借 quickjs 自身跑正则）
+    std::string cleaned = js;
+    {
+        JSValue fn = JS_GetGlobalObject(ctx);
+        JSValue f = JS_GetPropertyStr(ctx, fn, "__milPreprocess");
+        JS_FreeValue(ctx, fn);
+        if (JS_IsFunction(ctx, f)) {
+            JSValue arg = JS_NewStringLen(ctx, js.c_str(), js.size());
+            JSValue r2 = JS_Call(ctx, f, JS_UNDEFINED, 1, &arg);
+            if (!JS_IsException(r2)) {
+                const char* cs = JS_ToCString(ctx, r2);
+                if (cs) cleaned = cs;
+                if (cs) JS_FreeCString(ctx, cs);
+            } else {
+                JSValue e2 = JS_GetException(ctx);
+                JS_FreeValue(ctx, e2);  // 预处理失败 → 原样执行
+            }
+            JS_FreeValue(ctx, r2);
+            JS_FreeValue(ctx, arg);
+        }
+        JS_FreeValue(ctx, f);
+    }
+
+    JSValue r = JS_Eval(ctx, cleaned.c_str(), cleaned.size(), "<chart>", 0);
     if (JS_IsException(r)) {
         JSValue ex = JS_GetException(ctx);
         const char* msg = JS_ToCString(ctx, ex);
@@ -355,6 +460,8 @@ static Builder ExecuteToBuilderImpl(const std::string& js, std::string* err) {
         g_builder = Builder{};  // 失败清空
     }
     JS_FreeValue(ctx, r);
+    // milplay 口径：谱面没写 timing 时给默认 BPM，避免下游空表
+    if (g_builder.bpms.empty()) g_builder.bpms.push_back({0.0, 120.0});
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
     return g_builder;

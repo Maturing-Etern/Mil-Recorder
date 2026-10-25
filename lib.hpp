@@ -1,5 +1,24 @@
 #include "mil_fx_emitter.hpp"
 
+// [Reveal] FFmpeg 软解头(gvideoenc 静态库已链 libavformat/libavcodec/libavutil)
+extern "C" {
+#include <gvideoenc/libavcodec/avcodec.h>
+#include <gvideoenc/libavformat/avformat.h>
+#include <gvideoenc/libavutil/imgutils.h>
+}
+
+// fdk-aac 解码器(静态库 libfdk-aac.a 随 gvideoenc 链入, 未带头文件; 原型按 fdk-aac 公开 ABI 手写)。
+// gvideoenc 的 FFmpeg 构建 --disable-decoders 只有 h264 解码器, aac 解码必须走 fdk。
+// 返回值 AAC_DECODER_ERROR 实为 enum(int), 按同宽整型声明不影响调用约定。
+typedef struct FdkAacDecoder_ FdkAacDecoder;
+extern "C" {
+FdkAacDecoder* aacDecoder_Open(int transportType, unsigned int nrOfLayers);
+void aacDecoder_Close(FdkAacDecoder* self);
+unsigned int aacDecoder_Fill(FdkAacDecoder* self, unsigned char* pBuffer[], const unsigned int bufferSize[], unsigned int* bytesValid);
+unsigned int aacDecoder_DecodeFrame(FdkAacDecoder* self, short* pBuffer, const unsigned int pBufferLen, unsigned int* pInfo);
+const unsigned int* aacDecoder_GetStreamInfo(FdkAacDecoder* self);   // CStreamInfo{sampleRate,frameSize,numChannels,...}
+}
+
 namespace geasy_phi {
     using gdecoded_rgba_texture::DecodedRGBATexture;
     using gsp::gsp;
@@ -4020,6 +4039,12 @@ void main() {
             if (type == 2) return EnumMilNoteType::Fracture;
             return EnumMilNoteType::Hit;
         }
+        // 自制谱(REM/ingame)格式: 0=tap 1=drag 2=hold 3=闪电。hold 在 Milthm 里 = Hit + 非零时区, 故 2 → Hit
+        static EnumMilNoteType FromRemInt(uint64 type) {
+            if (type == 1) return EnumMilNoteType::Drag;
+            if (type == 3) return EnumMilNoteType::Fracture;
+            return EnumMilNoteType::Hit;
+        }
     };
 
     struct MilStoryboardTypeHelper {
@@ -4056,6 +4081,12 @@ void main() {
         Vec2 worldOrigin, worldViewport;
         float64 speedUnit;
         float64 holdDisappearTime = 0.2;
+        // 角度域: false = milplay 域(官方 fmt2/官方 devjson, 线体 180-LR / 音符 -(LR+NR))
+        //         true  = RPU 域(RE 编辑器导出的 devjson, 根节点带 _rem 键; RPU 源码 GameMain.cs:276
+        //                 线整体转 90-LR(Unity y-up) 与 milplay 线体 -LR 左右镜像, 竖直 LR=90 恒等不可见;
+        //                 :447 音符贴图 localRotation=NR 不随线倾)。10-21 管线层统一 milplay 口径时
+        //                 把 RE 自制谱连带镜像 = 用户报的"角度远古 bug 重现"
+        bool rpuOrientation = false;
 
         std::string getFinalDifficultyString() {
             auto ret = difficultyName + " ";
@@ -4085,6 +4116,7 @@ void main() {
         float64 (* easingIntFunc)(void*, float64);
         void* easingFuncContext;
         uint64 index;
+        std::optional<std::vector<float64>> customEaseArr;
 
         float64 cumulativeValueAtStart;
 
@@ -4095,12 +4127,14 @@ void main() {
                     { EnumMilEventType::Transparency, 1 },
                     { EnumMilEventType::Size, 1 },
                     { EnumMilEventType::Rotation, 90 },
-                    { EnumMilEventType::FlowSpeed, 1 },
+                    { EnumMilEventType::FlowSpeed, 9 },
                     { EnumMilEventType::LineBodyTransparency, 1 },
                     { EnumMilEventType::LineHeadTransparency, 1 },
                     { EnumMilEventType::Speed, 1 },
                     { EnumMilEventType::WholeTransparency, 1 },
-                    { EnumMilEventType::VisibleArea, (float64)2500 / 1080 }
+                    // [RPU 对齐] RainPlayerUnity MilAnimationDefaults.Line[23] = 1e9(默认不裁)。
+                    // 旧值 2500/1080 ≈ 2.31 mil 单位, 裁剪一旦生效会把所有未到场音符裁光。
+                    { EnumMilEventType::VisibleArea, 1e9 }
                 } },
                 { EnumMilObjectType::Note, {
                     { EnumMilEventType::Transparency, 1 },
@@ -4138,6 +4172,16 @@ void main() {
                 p = easingFunc(easingFuncContext, p);
             }
 
+            if (customEaseArr.has_value()) {
+                auto& values = customEaseArr.value();
+                p = std::clamp(p, 0.0, 1.0);
+                uint64 idx = (uint64)(p * (values.size() - 1));
+                auto s = values[idx];
+                auto e = values[idx < values.size() - 1 ? idx + 1 : idx];
+                p = std::fmod(p, 1.0 / (values.size() - 1)) * (values.size() - 1);
+                return s + (e - s) * p;
+            }
+
             return valueZone.x + p * (valueZone.y - valueZone.x);
         }
 
@@ -4163,8 +4207,17 @@ void main() {
     struct MilAnimGroup {
         std::vector<MilEvent> events[(uint64)EnumMilEventType::MAX];
         EnumMilObjectType objType;
+        float64 lineDefaultFlowSpeed = 9.0;
+        // [RPU 对齐] Speed 积分口径: true = RainPlayerUnity 梯形积分(段内 cumul+(t-t0)*(v(t)+start)/2,
+        // 跨段 dur*(start+end)/2 + gap*end), false = 解析积分(easingIntFunc, easy-phi/devjson 口径)
+        bool rpuSpeedTrapezoid = false;
 
         void addEvent(const MilEvent& e) { events[(uint64)e.type].push_back(e); }
+
+        float64 getDefaultValue(EnumMilEventType type) const noexcept {
+            if (objType == EnumMilObjectType::Line && type == EnumMilEventType::FlowSpeed) return lineDefaultFlowSpeed;
+            return MilEvent::getDefaultValue(objType, type);
+        }
 
         void init() {
             std::ranges::fill(lastUpdatedTimes, -std::numeric_limits<float64>::infinity());
@@ -4179,7 +4232,7 @@ void main() {
                 });
 
                 if (typedEvents.empty()) {
-                    auto value = MilEvent::getDefaultValue(objType, (EnumMilEventType)i);
+                    auto value = getDefaultValue((EnumMilEventType)i);
                     currentValues[i] = value;
                     currentValueZones[i] = Vec2(value);
                 }
@@ -4193,7 +4246,7 @@ void main() {
 
             if (typedEvents.empty()) {
                 if (type == (uint64)EnumMilEventType::Speed) {
-                    currentValues[type] = MilEvent::getDefaultValue(objType, (EnumMilEventType)type) * t;
+                    currentValues[type] = getDefaultValue((EnumMilEventType)type) * t;
                 }
 
                 return;
@@ -4207,7 +4260,20 @@ void main() {
             auto& e = typedEvents[currentIndexs[type]];
 
             if (type == (uint64)EnumMilEventType::Speed) {
-                currentValues[type] = e.cumulativeValueAtStart + e.getIntegralValue(t);
+                if (rpuSpeedTrapezoid) {
+                    // [RPU 对齐] RainPlayerUnity MilAnimationCollection.Update(Speed) 三段式
+                    if (t < e.timeZone.x) {
+                        currentValues[type] = e.cumulativeValueAtStart - (e.timeZone.x - t) * e.valueZone.x;
+                    } else if (t <= e.timeZone.y) {
+                        currentValues[type] = e.cumulativeValueAtStart + (t - e.timeZone.x) * (e.valueAtTime(t) + e.valueZone.x) / 2.0;
+                    } else {
+                        currentValues[type] = e.cumulativeValueAtStart
+                            + (e.timeZone.y - e.timeZone.x) * (e.valueZone.x + e.valueZone.y) / 2.0
+                            + (t - e.timeZone.y) * e.valueZone.y;
+                    }
+                } else {
+                    currentValues[type] = e.cumulativeValueAtStart + e.getIntegralValue(t);
+                }
             } else {
                 currentValues[type] = e.valueAtTime(t);
             }
@@ -4222,7 +4288,7 @@ void main() {
 
         std::optional<float64> getAlwaysValue(EnumMilEventType type) noexcept {
             auto& typedEvents = events[(uint64)type];
-            if (typedEvents.empty()) return MilEvent::getDefaultValue(objType, type);
+            if (typedEvents.empty()) return getDefaultValue(type);
 
             if (type == EnumMilEventType::Speed) {
                 if (typedEvents.size() == 1 && typedEvents[0].valueZone.isZeroZone()) {
@@ -4268,6 +4334,22 @@ void main() {
             auto& speedEvents = events[(uint64)EnumMilEventType::Speed];
             if (speedEvents.empty()) return;
 
+            if (rpuSpeedTrapezoid) {
+                // [RPU 对齐] RainPlayerUnity InitSpeedEvents: 首事件前 fp=t*start;
+                // 每段累计 += dur*(start+end)/2, 段间空隙 += gap*end(梯形近似, 非解析积分)
+                float64 cumulativeValue = speedEvents[0].timeZone.x * speedEvents[0].valueZone.x;
+                for (uint64 i = 0; i < speedEvents.size(); i++) {
+                    auto& e = speedEvents[i];
+                    e.cumulativeValueAtStart = cumulativeValue;
+                    if (i < speedEvents.size() - 1) {
+                        auto& next = speedEvents[i + 1];
+                        cumulativeValue += (e.timeZone.y - e.timeZone.x) * (e.valueZone.x + e.valueZone.y) / 2.0
+                            + (next.timeZone.x - e.timeZone.y) * e.valueZone.y;
+                    }
+                }
+                return;
+            }
+
             float64 cumulativeValue = speedEvents[0].timeZone.x * speedEvents[0].valueZone.x;
 
             for (uint64 i = 0; i < speedEvents.size(); i++) {
@@ -4300,10 +4382,14 @@ void main() {
 
         ObjectIndexGenerator<ObjDesc> indexGen;
         std::unordered_map<uint64, MilAnimGroup> groups;
+        float64 lineDefaultFlowSpeed = 9.0;
+        bool rpuSpeedTrapezoid = false;
 
         MilAnimGroup& requestGroup(const ObjDesc& obj) {
             auto& ret = groups.try_emplace(indexGen.get(obj), MilAnimGroup { }).first->second;
             ret.objType = obj.first;
+            ret.lineDefaultFlowSpeed = lineDefaultFlowSpeed;
+            ret.rpuSpeedTrapezoid = rpuSpeedTrapezoid;
             return ret;
         }
 
@@ -4321,7 +4407,9 @@ void main() {
             auto group_it = groups.find(obj.second);
 
             if (group_it == groups.end()) {
-                auto value = MilEvent::getDefaultValue(obj.first, type);
+                auto value = (obj.first == EnumMilObjectType::Line && type == EnumMilEventType::FlowSpeed)
+                    ? lineDefaultFlowSpeed
+                    : MilEvent::getDefaultValue(obj.first, type);
                 if (type == EnumMilEventType::Speed) value *= t;
                 return value;
             }
@@ -4461,6 +4549,9 @@ void main() {
         uint64 lineIndex;
         Vec2 floorPosition;
         bool isSimul;
+        // [REM bindNoteSize] 权威 = sim track_player/chart_player: true(默认) 音符偏移与贴图
+        // 随轨道 scale; false 不随。本家 fmt2/devjson 无此概念 = 恒 true, 默认值保证零回归
+        bool bindNoteSize = true;
         MilNoteTextureDesc textureDesc;
         EnumMilFinalNoteType finalType;
 
@@ -4634,10 +4725,14 @@ void main() {
     };
     inline constexpr uint64 MilFxFxLayerCount = (uint64)milfx::LayerCount;
 
-    // 四层全开, 与本家规格一致: VerticalStrike(1) + LongLightning(6) + Explode(14) + Pass(25)。
-    // 2026-09-22: 之前只发 Pass 层 -> 本家命中时那个巨大的白色爆闪全丢了, 画面上只剩
-    // 暗淡小粒子 + hitEffect 蓝紫细环, 看起来像"气泡"。主体其实是 Explode 的 14 条
-    // 放射长闪电: 长度 = size*speed*lengthScale = 0.15*5*5 = 3.75 unity ≈ 237 px。
+    // 🔴 2026-10-17 反汇编钉死(libil2cpp PlayJudgements): Fracture 判定后**二选一**, 不是四层齐播:
+    //   ProcessJudgeStatus: HitType==3(Fracture) 时 JudgeLevel 硬覆盖 = (NextStatus != Missed) ? Exact : Miss
+    //   ShowJudgeAnimation: type==Fracture -> 池索引 = (JudgeLevel == Miss) ? FractureExplode(1) : FracturePass(0)
+    //   即 **过线/AutoHit/打中 = 只播 FracturePass 单层**(Billboard 25 颗, 音符层之下);
+    //   **只有拍歪 Miss 才播 FractureExplode 四层**(VerticalStrike+LongLightning+Explode+Sparks,Stretch 条纹)。
+    //   本渲染器无输入、闪电恒为 AutoHit => 判定后只发 Pass 层; 四层规格仍保留在 mil_fx_emitter.hpp
+    //   (2026-09-22 的"四层全开"是把本家 hold 完成特效的白色爆闪误记到了 Fracture 头上, 09-22 对照图
+    //   layers4_vs_official 里的"本家爆闪"实为 28.667s 的 hold 完成闪光, 比首个 Fracture(29.35s) 早 0.7s)。
     inline constexpr bool milFxLayerEnabled[MilFxFxLayerCount] = { true, true, true, true };
 
     // 渲染器侧「整体缩放」: 等比作用于 粒子尺寸 + 散布半径 + 位移, 粒子的相对比例与形态完全不变。
@@ -4674,9 +4769,12 @@ void main() {
 
     // Unity 世界单位 -> 渲染像素。Fracture 精灵在 Unity 里 m_Size=(1.87,1.87), 渲染器绘制该音符
     // 用 lineHeadBase*1.77 px, 故 1 unit = lineHeadBase*1.77/1.87 px。
-    // 锚在音符自身尺寸上(音符已 1:1 验收), 比按参考视频标定可靠。
+    // [2026-10-17 粒径修正] 再乘 1.5 = FracturePass/FractureExplode 预制体里粒子子节点自身的
+    // localScale。ShowJudgeAnimation 实例化 scale=音符x4.0 与预制体根 scale1.5 被音符/线容器链
+    // 抵消, 但 PS 子节点的 1.5 无链可抵 -> 净系数 1.5。实拍验证: 1920x1080 下本家 Pass 粒子
+    // 峰值 6~12px(frac_measure60 逐帧 blob 实测), 旧系数(无 1.5)只有 2~4px, 乘 1.5 后 6~11px 吻合。
     inline float64 milFractureUnitScaleOf(float64 lineHeadBase) noexcept {
-        return lineHeadBase * 1.77 / 1.87;
+        return lineHeadBase * 1.77 / 1.87 * 1.5;
     }
 
     // 粒子类型与层参数全部来自 mil_fx_emitter.hpp; 这里只按层分组存放
@@ -4830,7 +4928,12 @@ void main() {
             
             Transform2D lineTransform {};
             lineTransform.translate(linePosition);
-            lineTransform.rotateDegrees(90 - lineRotation);
+            // [旋转方向对齐 RPU] RainPlayerUnity MilDataStructs.GetCanvasTransform:
+            //   world = lineCenter + lineSize * R(90-rot) * (px, py)（canvas y-up）
+            //   ⇒ 屏幕偏移 x ∝ -sin(90-rot)*fp, y ∝ -cos(90-rot)*fp（y-down）
+            // 旧实现 scale(1,-1) 在 rotate 之前，等于让旋转作用在 y-down 帧，旋转线整体左右镜像。
+            // 90-rot → rot-90 等价于把旋转角取反（x 分量镜像），rot=90 时恒等、竖直线不受影响。
+            lineTransform.rotateDegrees(lineRotation - 90);
             lineTransform.scale(screenSize / meta.worldViewport.abs());
             lineTransform.scale(lineSize);
             lineTransform.scale(1.0, -1.0);
@@ -4854,9 +4957,11 @@ void main() {
                 noteFloorPosition.x = 0.0;
             }
             
-            if (noteFloorPosition.x > lineVisibleArea) {
-                info.setHidden();
-            }
+            // [VisibleArea 对齐 RPU] RainPlayerUnity GameMain: if (noteFp > MilToCanvasY(lineVisArea)) noteColor.a = 0。
+            // 旧实现把 setHidden() 放在 info.color 赋值之前, 随后 info.color = noteColor.applyAlpha(...)
+            // 把 a=0 覆盖回 1.0 → 裁剪是死代码。RPU 判定用同一 fp 差值(mil 单位, canvas 缩放相消),
+            // 这里改为先记 flag, 在 color 最终赋值之后生效。
+            bool visAreaCull = noteFloorPosition.x > lineVisibleArea;
 
             if (animator.has(note, EnumMilEventType::PositionY)) {
                 noteFloorPosition -= noteFloorPosition.x;
@@ -4870,14 +4975,33 @@ void main() {
 
             auto noteRelPositionHead = noteBasePosition + Vec2 { 0.0, noteFloorPosition.x },
                 noteRelPositionTail = noteBasePosition + Vec2 { 0.0, noteFloorPosition.y };
-            
+
+            // [REM bindNoteSize 对齐权威 sim chart_player.gd _get_note_pos]
+            //   bind=false(REM 显式关闭): 音符局部偏移(含 x 偏移与滚动位移)不随轨道 scale ——
+            //   在 scale(lineSize) 之前的坐标系除回 lineSize; 贴图 scale 同样不乘 lineSize。
+            //   bind=true(默认, 本家谱面恒此支): 保持原行为(乘 lineSize)。
+            float64 noteLineScale = lineSize;
+            if (!note.bindNoteSize && std::fabs(lineSize) > 1e-9) {
+                float64 invLineSize = 1.0 / lineSize;
+                noteRelPositionHead.x *= invLineSize;
+                noteRelPositionHead.y *= invLineSize;
+                noteRelPositionTail.x *= invLineSize;
+                noteRelPositionTail.y *= invLineSize;
+                noteLineScale = 1.0;
+            }
+
             info.headPosition = lineTransform.transformPoint(noteRelPositionHead);
             info.tailPosition = lineTransform.transformPoint(noteRelPositionTail);
+            // 精灵角度(2026-10-21 对齐 milplay 权威 port.js/base.js):
+            //   音符贴图 texRot = -(LR+NR), 速度向量 = -LR(flow<0 再+180)。
+            //   10-14 的 180+LR+NR 是对 RPU 的过度对齐(当时 RPU 对照实为 dumpmil 透传比对,
+            //   贴图公式从未被独立验证); 竖直 LR=90 时 -90≡270 与旧值一致, 竖直渲染不变。
             info.textureRotation = -lineRotation - noteRotation;
             info.speedVectorRotation = -lineRotation;
             if (finalFlowSpeed < 0) info.speedVectorRotation += 180.0;
-            info.scale = Vec2(lineSize * noteSize);
+            info.scale = Vec2(noteLineScale * noteSize);
             info.color = noteColor.applyAlpha(lineWholeAlpha * noteAlpha);
+            if (visAreaCull) info.color.a = 0.0;
 
             return info;
         }
@@ -4940,7 +5064,8 @@ void main() {
                 for (uint64 j = 0; j < line.notes.size(); j++) {
                     auto& note = line.notes[j];
                     if (note.isFake) continue;
-                    // Fracture = AutoHit 音符: 无判定环、无常规打击粒子; 撞击走 FractureExplode 特效(见 initFractureFxs)
+                    // Fracture = AutoHit 音符: 无判定环、无常规打击粒子; 撞击走 FracturePass 特效(见 initFractureFxs;
+                    // 反汇编 2026-10-17: 过线只播 FracturePass 单层, FractureExplode 四层是 Miss 专属)
                     if (note.isFracture()) continue;
 
                     auto& item = hitEffects.emplace_back();
@@ -4986,7 +5111,8 @@ void main() {
             std::sort(comboTimes.begin(), comboTimes.end());
         }
 
-        // Fracture 撞击特效: 按 FractureExplode 预置体四层规格生成确定性粒子。
+        // Fracture 撞击特效: 按 APK 预置体规格生成确定性粒子(全 4 层数据都建,
+        // 渲染侧只发 Pass 层 = 本家过线语义, 见 calculateMilFrame 里的门控注释)。
         // 触发时刻 = note 落到判定线的时刻(note.timeZone.x), 与 AutoHit 结算同刻。
         void initFractureFxs() {
             fractureFxs.clear();
@@ -5028,6 +5154,9 @@ void main() {
         chart.meta.worldOrigin = { (float64)-1920 / 2, (float64)1080 / 2 };
         chart.meta.worldViewport = { 1920, -1080 };
         chart.meta.speedUnit = 108.0;
+        // RE 编辑器(Rain Editor)导出的 devjson 带根节点 _rem 键 → 角度按 RPU 口径(见 MilMeta::rpuOrientation);
+        // 官方谱无 _rem → milplay 口径
+        chart.meta.rpuOrientation = jsonRoot.hasKey("_rem");
         if (!jsonRoot.isObject()) err("root is not an object");
         if (!jsonRoot.hasKey("meta")) err("missing meta");
         if (!jsonRoot["meta"].isObject()) err("meta is not an object");
@@ -5190,6 +5319,22 @@ void main() {
                     return EaseSet::Milthm::easing_int(ease, press, p);
                 };
             }
+            if (animNode.hasKey("isCustomEase")) {
+                if (!animNode["isCustomEase"].isBool()) err("isCustomEase is not a bool");
+
+                if (animNode["isCustomEase"].getBool()) {
+                    e.customEaseArr = std::vector<float64>();
+                    auto& customEaseArr = e.customEaseArr.value();
+
+                    if (!animNode.hasKey("customEaseArr")) err("missing customEaseArr");
+                    if (!animNode["customEaseArr"].isArray()) err("customEaseArr is not an array");
+
+                    for (auto& itNode : animNode["customEaseArr"].getArray()) {
+                        if (!itNode.isNumber()) err("customEaseArr item is not a number");
+                        customEaseArr.push_back(itNode.getNumber());
+                    }
+                }
+            }
             chart.animator.addEvent({ objType, objIndex }, e);
         }
         chart.rawHash = data.getHash();
@@ -5199,14 +5344,17 @@ void main() {
         auto err = [](const std::string& msg) { throw std::runtime_error(std::format("ingame: {}", msg)); };
         auto jsonRoot = JsonNode::Parse(data);
         MilChart chart {};
-        chart.meta.noteFlowSpeedBehavior = MilMeta::NoteFlowSpeedBehavior::Override;
+        chart.meta.noteFlowSpeedBehavior = MilMeta::NoteFlowSpeedBehavior::Multiply;
         chart.meta.worldOrigin = { (float64)-1920 / 2, (float64)1080 / 2 };
         chart.meta.worldViewport = { 1920, -1080 };
-        chart.meta.speedUnit = 108.0;
+        chart.meta.speedUnit = 120.0;
+        chart.animator.lineDefaultFlowSpeed = 1.0;
+        chart.animator.rpuSpeedTrapezoid = true;
         if (!jsonRoot.isObject()) err("root is not an object");
         if (!jsonRoot.hasKey("meta")) err("missing meta");
         if (!jsonRoot["meta"].isObject()) err("meta is not an object");
         auto& metaNode = jsonRoot["meta"];
+        float64 chartOffset = (metaNode.hasKey("offset") && metaNode["offset"].isNumber()) ? metaNode["offset"].getNumber() : 0.0;
         if (metaNode.hasKey("name") && metaNode["name"].isString()) chart.meta.title = metaNode["name"].getString();
         if (metaNode.hasKey("music_artist") && metaNode["music_artist"].isString()) chart.meta.composer = metaNode["music_artist"].getString();
         if (metaNode.hasKey("background_artist") && metaNode["background_artist"].isString()) chart.meta.artist = metaNode["background_artist"].getString();
@@ -5233,13 +5381,13 @@ void main() {
         // Convert beat positions → seconds using running sum
         { float64 running = 0.0, lastBeat = 0.0; for (size_t i=0; i<bpms.size(); i++) { running += (bpmBeats[i]-lastBeat)*(60.0/bpms[i].bpm); bpms[i].time=running; lastBeat=bpmBeats[i]; } }
         auto beatToSec = [&](float64 beat) -> float64 {
-            if (beat <= 0.0) return 0.0;
+            if (beat <= 0.0) return chartOffset;
             float64 total = 0.0, prevBeat = 0.0, prevBpm = bpms[0].bpm;
             for (size_t i = 0; i < bpmBeats.size(); i++) {
-                if (bpmBeats[i] >= beat) { return total + (beat - prevBeat) * (60.0 / prevBpm); }
+                if (bpmBeats[i] >= beat) { return chartOffset + total + (beat - prevBeat) * (60.0 / prevBpm); }
                 total += (bpmBeats[i] - prevBeat) * (60.0 / prevBpm); prevBeat = bpmBeats[i]; prevBpm = bpms[i].bpm;
             }
-            return total + (beat - prevBeat) * (60.0 / prevBpm);
+            return chartOffset + total + (beat - prevBeat) * (60.0 / prevBpm);
         };
         auto readBeatArray = [&](JsonNode& node, const std::string& key, float64* dst) -> bool {
             if (!node.hasKey(key)) return false;
@@ -5254,7 +5402,12 @@ void main() {
         for (auto& lineNode : jsonRoot["lines"].getArray()) {
             if (!lineNode.isObject()) err("line is not an object");
             auto& line = chart.lines.emplace_back();
-            line.indexer.set(chart.animator.indexGen.get({ EnumMilObjectType::Line, lineIndex++ }));
+            // [RPU 对齐] RainPlayerUnity 按 JSON 显式 index 绑定事件(bearer == line.index),
+            // 缺 index 时回退数组序。音符事件同样按 note.index 匹配且作用域限定本线
+            // (RPU: 每条线的 notesMap 各自匹配), 故 Note 键用 lineIdx<<32|noteIdx 复合隔离。
+            uint64 linePos = lineIndex++;
+            uint64 lineIdx = (lineNode.hasKey("index") && lineNode["index"].isNumber()) ? (uint64)lineNode["index"].getNumber() : linePos;
+            line.indexer.set(chart.animator.indexGen.get({ EnumMilObjectType::Line, lineIdx }));
             if (!lineNode.hasKey("notes")) err("missing notes");
             if (!lineNode["notes"].isArray()) err("notes is not an array");
             for (auto& noteNode : lineNode["notes"].getArray()) {
@@ -5264,10 +5417,11 @@ void main() {
                 if (!readBeatArray(noteNode, "endTime", &note.timeZone.y)) note.timeZone.y = note.timeZone.x;
                 if (!noteNode.hasKey("type")) err("missing type");
                 if (!noteNode["type"].isNumber()) err("type is not a number");
-                note.type = MilNoteTypeHelper::FromInt(noteNode["type"].getNumber());
+                note.type = MilNoteTypeHelper::FromRemInt(noteNode["type"].getNumber());
                 if (noteNode.hasKey("isFake") && noteNode["isFake"].isBool()) note.isFake = noteNode["isFake"].getBool();
                 if (noteNode.hasKey("isAlwaysPerfect") && noteNode["isAlwaysPerfect"].isBool()) note.isAlwaysPerfect = noteNode["isAlwaysPerfect"].getBool();
-                note.indexer.set(chart.animator.indexGen.get({ EnumMilObjectType::Note, (uint64)(line.notes.size() - 1) }));
+                uint64 noteIdx = (noteNode.hasKey("index") && noteNode["index"].isNumber()) ? (uint64)noteNode["index"].getNumber() : (uint64)(line.notes.size() - 1);
+                note.indexer.set(chart.animator.indexGen.get({ EnumMilObjectType::Note, (lineIdx << 32) | noteIdx }));
             }
             if (lineNode.hasKey("animations") && lineNode["animations"].isArray()) {
                 for (auto& animNode : lineNode["animations"].getArray()) {
@@ -5284,14 +5438,26 @@ void main() {
                         if (animNode.hasKey("end")) { if (animNode["end"].isNumber()) e.valueZone.y = animNode["end"].getNumber(); else if (animNode["end"].isString()) try { e.valueZone.y = std::stod(animNode["end"].getString()); } catch(...){} }
                     }
                     auto objType = MilObjectTypeHelper::FromInt(animNode.hasKey("bearer_type") && animNode["bearer_type"].isNumber() ? animNode["bearer_type"].getNumber() : 0);
-                    uint64 objIndex = animNode.hasKey("bearer") && animNode["bearer"].isNumber() ? animNode["bearer"].getNumber() : (uint64)(&line - chart.lines.data());
+                    // [RPU 对齐] 音符事件 bearer == note.index(线内), 复合键隔离不同线的同名 note.index;
+                    // 线/故事板事件 bearer 仍为全局 index。
+                    uint64 bearerRaw = animNode.hasKey("bearer") && animNode["bearer"].isNumber() ? animNode["bearer"].getNumber() : lineIdx;
+                    uint64 objIndex = (objType == EnumMilObjectType::Note) ? ((lineIdx << 32) | bearerRaw) : bearerRaw;
                     uint64 easeCfg = 0, pressCfg = 0;
+                    bool isValueExp = false;
                     if (animNode.hasKey("ease")) {
                         auto& easeNode = animNode["ease"];
                         if (easeNode.isNumber()) easeCfg = easeNode.getNumber();
-                        else if (easeNode.isObject()) { if (easeNode.hasKey("type") && easeNode["type"].isNumber()) easeCfg = easeNode["type"].getNumber(); if (easeNode.hasKey("press") && easeNode["press"].isNumber()) pressCfg = easeNode["press"].getNumber(); }
+                        else if (easeNode.isObject()) {
+                            if (easeNode.hasKey("type") && easeNode["type"].isNumber()) easeCfg = easeNode["type"].getNumber();
+                            if (easeNode.hasKey("press") && easeNode["press"].isNumber()) pressCfg = easeNode["press"].getNumber();
+                            // [RPU 对齐] RainPlayerUnity MilAnimEase: isValueExp=true 时强制 start=0,end=1
+                            // 且 easing() 恒返回 0(自定义表达式未实现) ⇒ 事件值恒为 0。
+                            // 等价实现: 值域清零 + 不挂缓动函数。clipLeft/clipRight RPU 未使用(声明即无操作)。
+                            if (easeNode.hasKey("isValueExp") && easeNode["isValueExp"].isBool() && easeNode["isValueExp"].getBool()) isValueExp = true;
                         }
-                    if (pressCfg != 0) { e.easingFuncContext = (void*)EaseSet::Milthm::pack(easeCfg, pressCfg); e.easingFunc = [](void* c, float64 p) { auto [x,y] = EaseSet::Milthm::unpack((uint64)c); return EaseSet::Milthm::easing(x,y,p); }; e.easingIntFunc = [](void* c, float64 p) { auto [x,y] = EaseSet::Milthm::unpack((uint64)c); return EaseSet::Milthm::easing_int(x,y,p); }; }
+                    }
+                    if (isValueExp) { e.valueZone = { 0.0, 0.0 }; easeCfg = 0; pressCfg = 0; }
+                    if (pressCfg != 0 && pressCfg <= 10) { e.easingFuncContext = (void*)EaseSet::Milthm::pack(easeCfg, pressCfg); e.easingFunc = [](void* c, float64 p) { auto [x,y] = EaseSet::Milthm::unpack((uint64)c); return EaseSet::Milthm::easing(x,y,p); }; e.easingIntFunc = [](void* c, float64 p) { auto [x,y] = EaseSet::Milthm::unpack((uint64)c); return EaseSet::Milthm::easing_int(x,y,p); }; }
                     chart.animator.addEvent({ objType, objIndex }, e);
                 }
             }
@@ -5328,10 +5494,13 @@ void main() {
             int64 type = 0;           // 0=tap 1=drag 2=hold 3=闪电
             Beat start, end;
             float64 speed = 1.0;
+            float64 positionX = 0.0;  // 音符横向偏移(REM 1500 参考系)
+            float64 size = 1.0;       // 音符缩放
+            int64 lane = 0;           // 编辑器元数据, REM 播放器不消费
             bool isFake = false, isAlwaysPerfect = false;
         };
         struct Track {
-            std::string id, name, image;
+            std::string id, parentId, name, image;   // v1.5: parentId 父子轨(0/空 = 顶层); id/parentId 兼容数字与字符串
             bool bindNoteSize = false;
             std::vector<Note> notes;
             std::map<std::string, std::vector<Anim>> anims;   // 事件键 → 数值事件表
@@ -5348,7 +5517,7 @@ void main() {
         std::vector<BpmChange> bpmChanges;
         Meta meta;
         std::vector<Track> tracks;
-        uint64 nSkippedLightning = 0;
+        uint64 nLightning = 0;
     };
 
     RemJson loadRemJson(const Data& data) {
@@ -5399,7 +5568,22 @@ void main() {
                 if (!(bpm > 0.0)) continue;
                 RemJson::BpmChange bc;
                 bc.bpm = bpm;
-                bc.beat = std::max<float64>(0.0, num(c, "beat", 1.0) - 1.0);
+                // v1.5: beat = [主拍,分子,分母] 1-based 三元组(与音符 startTime 同构) → 0-based 浮点拍;
+                // 兼容旧格式: beat 为单个浮点数(已是 0-based 浮点拍语义? 旧实现按 -1 处理, 维持)
+                if (c.hasKey("beat")) {
+                    auto& bn = c["beat"];
+                    if (bn.isArray()) {
+                        RemJson::Beat b;
+                        if (!readBeat(bn, b)) continue;
+                        bc.beat = (b.main - 1.0) + (b.den != 0.0 ? b.num / b.den : 0.0);
+                    } else if (bn.isNumber()) {
+                        bc.beat = bn.getNumber() - 1.0;
+                    } else {
+                        continue;
+                    }
+                } else {
+                    bc.beat = 0.0;
+                }
                 rem.bpmChanges.push_back(bc);
             }
         }
@@ -5431,7 +5615,13 @@ void main() {
                 auto takeStr = [&](const char* k, std::string& dst) {
                     if (t.hasKey(k) && t[k].isString()) dst = t[k].getString();
                 };
-                takeStr("id", track.id);
+                // id/parentId: 字符串原样; 数字(编辑器写法) → 整数字符串化, 保证两侧能互配
+                auto asIdStr = [](JsonNode& n, std::string& dst) {
+                    if (n.isString()) dst = n.getString();
+                    else if (n.isNumber()) dst = std::to_string((int64)n.getNumber());
+                };
+                if (t.hasKey("id")) asIdStr(t["id"], track.id);
+                if (t.hasKey("parentId")) asIdStr(t["parentId"], track.parentId);
                 takeStr("name", track.name);
                 takeStr("image", track.image);
                 if (t.hasKey("bindNoteSize") && t["bindNoteSize"].isBool())
@@ -5442,11 +5632,14 @@ void main() {
                         if (!n.isObject()) continue;
                         RemJson::Note note;
                         note.type = (int64)num(n, "type", 0.0);
-                        if (note.type == 3) { rem.nSkippedLightning++; continue; }   // 闪电音符：暂不支持
+                        if (note.type == 3) rem.nLightning++;   // 闪电音符
                         if (n.hasKey("startTime")) readBeat(n["startTime"], note.start);
                         if (n.hasKey("endTime")) readBeat(n["endTime"], note.end);
                         if (!note.end.valid) note.end = note.start;
                         note.speed = num(n, "speed", 1.0);
+                        note.positionX = num(n, "positionX", 0.0);
+                        note.size = num(n, "size", 1.0);
+                        note.lane = (int64)num(n, "lane", 0.0);
                         if (n.hasKey("isFake") && n["isFake"].isBool()) note.isFake = n["isFake"].getBool();
                         if (n.hasKey("isAlwaysPerfect") && n["isAlwaysPerfect"].isBool())
                             note.isAlwaysPerfect = n["isAlwaysPerfect"].getBool();
@@ -5502,10 +5695,12 @@ void main() {
     // 所有 REM ↔ Milthm 的单位/坐标系换算集中在此，便于校准与复用。
     struct RemUnits {
         // 坐标：REM 参考空间 1500x900 → Milthm 世界 1920x1080
-        //   PositionX = remX * (1920/1500) - 960
+        //   权威 = Godot 播放器 chart_player.gd:368 uniform_scale = min(W/1500, H/900)（等比）
+        //   16:9 下 uniform = 1080/900 = 1.2（x 曾错写 1920/1500=1.28 → 横向拉伸 6.67%）
+        //   PositionX = (remX - 750) * 1.2 = remX * 1.2 - 900
         //   PositionY = 540 - remY * (1080/900)          （y 轴翻转）
-        float64 posXScale = 1920.0 / 1500.0;
-        float64 posXBias = -960.0;
+        float64 posXScale = 1080.0 / 900.0;
+        float64 posXBias = -750.0 * (1080.0 / 900.0);
         float64 posYScale = -1080.0 / 900.0;
         float64 posYBias = 540.0;
         // 旋转：REM 0 = 朝上、顺时针为正；Milthm 0 = 朝右、默认 90 → Milthm = 90 - REM
@@ -5530,6 +5725,9 @@ void main() {
     MilChart buildMilChartFromRemJson(const RemJson& rem, const RemUnits& u = RemUnits {}) {
         MilChart chart {};
         chart.meta.noteFlowSpeedBehavior = MilMeta::NoteFlowSpeedBehavior::Override;
+        // [REM 对齐] 线默认流速 = 1(REM 播放器: 滚动 = speedEvent × base_speed, 无线级 flow 概念;
+        // 默认 9 会让无 speed 字段的音符 9 倍速飞出屏幕)
+        chart.animator.lineDefaultFlowSpeed = 1.0;
         chart.meta.worldOrigin = { (float64)-1920 / 2, (float64)1080 / 2 };
         chart.meta.worldViewport = { 1920, -1080 };
         chart.meta.speedUnit = u.speedUnit();
@@ -5641,25 +5839,91 @@ void main() {
             { "speedEvent", EnumMilEventType::Speed,                1.0,              0.0 },  // 单位随 speedUnit
         };
 
+        // ---- v1.5 父子轨(仅 x/y 继承): 求值辅助 + 父链解析 ----
+        // evalAnims 端点语义: before-first = 最早事件 sv / after-last = 最晚事件 tv / 覆盖段取 start 最大者
+        struct RemAnimEval { bool has = false; float64 v = 0.0; int64 easing = 1; };
+        auto evalAnims = [&](const std::vector<RemJson::Anim>& as, float64 t) -> RemAnimEval {
+            RemAnimEval out;
+            if (as.empty()) return out;
+            const RemJson::Anim* active = nullptr; float64 aS = 0.0;
+            const RemJson::Anim* lastDone = nullptr; float64 dS = 0.0;
+            const RemJson::Anim* firstFuture = nullptr; float64 fS = 0.0;
+            for (auto& a : as) {
+                float64 s = beatToSec(a.start), e2 = beatToSec(a.end);
+                if (e2 < s) std::swap(s, e2);
+                if (s <= t && t <= e2) {
+                    if (!active || s >= aS) { active = &a; aS = s; }
+                } else if (e2 < t) {
+                    if (!lastDone || s >= dS) { lastDone = &a; dS = s; }
+                } else {
+                    if (!firstFuture || s < fS) { firstFuture = &a; fS = s; }
+                }
+            }
+            if (active) {
+                float64 s = beatToSec(active->start), e2 = beatToSec(active->end);
+                if (e2 < s) std::swap(s, e2);
+                float64 p = (e2 > s) ? (t - s) / (e2 - s) : 1.0;
+                auto [ez, pr] = EaseSet::Milthm::unpack(remEasingPack(active->easing));
+                out.v = active->sv + (active->tv - active->sv) * EaseSet::Milthm::easing(ez, pr, p);
+                out.easing = active->easing;
+            } else if (lastDone) {
+                out.v = lastDone->tv;
+            } else if (firstFuture) {
+                out.v = firstFuture->sv;
+            } else {
+                return out;
+            }
+            out.has = true;
+            return out;
+        };
+        std::map<std::string, size_t> remTrackIdx;
+        for (size_t i = 0; i < rem.tracks.size(); i++)
+            if (!rem.tracks[i].id.empty()) remTrackIdx.emplace(rem.tracks[i].id, i);
+        // 父链: 累加祖先 local 值(文档 2.4, 不是祖先 world 值); 自引/环 → 整链降级顶层; 缺失父轨 → 截断
+        auto resolveParentChain = [&](const RemJson::Track& tr) -> std::vector<const RemJson::Track*> {
+            std::vector<const RemJson::Track*> chain;
+            if (tr.parentId.empty() || tr.parentId == "0") return chain;
+            std::map<std::string, bool> seen;
+            seen[tr.id] = true;   // 自引检测
+            std::string pid = tr.parentId;
+            int guard = 0;
+            while (!pid.empty() && pid != "0" && guard++ < 512) {
+                auto it = remTrackIdx.find(pid);
+                if (it == remTrackIdx.end()) break;
+                const RemJson::Track& p = rem.tracks[it->second];
+                if (seen.count(p.id)) return {};   // 环 → 降级顶层
+                seen[p.id] = true;
+                chain.push_back(&p);
+                pid = p.parentId;
+            }
+            return chain;
+        };
+
         uint64 nEvents = 0, lineIndex = 0;
         for (auto& track : rem.tracks) {
             uint64 thisLine = lineIndex++;
+            auto parentChain = resolveParentChain(track);
             auto& line = chart.lines.emplace_back();
             line.indexer.set(chart.animator.indexGen.get({ EnumMilObjectType::Line, thisLine }));
 
             // ---- notes ----
             for (auto& rn : track.notes) {
                 auto& note = line.notes.emplace_back();
+                // 音符键 = lineIdx<<32|noteIdx 复合(跨线隔离, 与 ingame loader 同口径)。
+                // ⚠ addEvent/lookup 必须都用原始复合键: animator.get 按 indexer 值直查 groups,
+                // addEvent 按 indexGen.get(desc) 落组 —— 传已映射的 indexer.get() 会二次映射进错组
+                uint64 noteKey = (thisLine << 32) | (uint64)(line.notes.size() - 1);
                 note.indexer.set(
-                    chart.animator.indexGen.get({ EnumMilObjectType::Note, (uint64)(line.notes.size() - 1) })
+                    chart.animator.indexGen.get({ EnumMilObjectType::Note, noteKey })
                 );
-                // type: 0=tap / 1=drag / 2=hold（hold 在 Milthm 里是 Hit + 非零时区）
-                note.type = MilNoteTypeHelper::FromInt(rn.type == 2 ? 0 : (uint64)rn.type);
+                // type: 0=tap / 1=drag / 2=hold（hold = Hit + 非零时区）/ 3=闪电(Fracture)
+                note.type = MilNoteTypeHelper::FromRemInt((uint64)rn.type);
                 float64 t0 = beatToSec(rn.start), t1 = beatToSec(rn.end);
                 if (t1 < t0) std::swap(t0, t1);
                 note.timeZone = { t0, t1 };
                 note.isFake = rn.isFake;
                 note.isAlwaysPerfect = rn.isAlwaysPerfect;
+                note.bindNoteSize = track.bindNoteSize;
 
                 // 音符级速度倍率 → Note 的 FlowSpeed 事件（恒定值覆盖音符生命周期）
                 if (std::fabs(rn.speed - 1.0) > 1e-6) {
@@ -5667,14 +5931,84 @@ void main() {
                     e.type = EnumMilEventType::FlowSpeed;
                     e.timeZone = { 0.0, t1 };
                     e.valueZone = { rn.speed, rn.speed };
-                    chart.animator.addEvent({ EnumMilObjectType::Note, note.indexer.get() }, e);
+                    chart.animator.addEvent({ EnumMilObjectType::Note, noteKey }, e);
+                }
+                // 音符横向偏移: REM 1500 参考系局部 x × uniform_scale(1.2) → Note PositionX 事件。
+                // mil 管线内该值再 × lineSize(=track scale) 与世界缩放, 与 mil_rem.hpp note_screen_pos
+                // 的 local_x = positionX * axis_scale(true) 等价
+                if (std::fabs(rn.positionX) > 1e-9) {
+                    MilEvent e {};
+                    e.type = EnumMilEventType::PositionX;
+                    e.timeZone = { 0.0, t1 };
+                    e.valueZone = { rn.positionX * 1.2, rn.positionX * 1.2 };
+                    chart.animator.addEvent({ EnumMilObjectType::Note, noteKey }, e);
+                }
+                // 音符缩放 → Note Size 事件(mil 基准 1.0 与制谱器预览实测一致, 不乘 1.2 贴图基准)
+                if (std::fabs(rn.size - 1.0) > 1e-6) {
+                    MilEvent e {};
+                    e.type = EnumMilEventType::Size;
+                    e.timeZone = { 0.0, t1 };
+                    e.valueZone = { rn.size, rn.size };
+                    chart.animator.addEvent({ EnumMilObjectType::Note, noteKey }, e);
                 }
             }
 
             // ---- 数值事件 ----
             for (auto& kd : kKeys) {
                 auto it = track.anims.find(kd.key);
-                if (it == track.anims.end()) continue;
+                const bool hasSelf = it != track.anims.end() && !it->second.empty();
+                // v1.5 父子轨: x/y = 自身 + 父链 local 求和 —— 按断点并集组合求值烘焙成新事件表
+                // (锚点精确; 段内 easing 取自身活跃事件, 父轨动画形状在子轨事件上为近似)
+                const bool isXY = (std::string(kd.key) == "x" || std::string(kd.key) == "y");
+                std::vector<const std::vector<RemJson::Anim>*> chainAnims;
+                if (isXY) {
+                    for (auto* p : parentChain) {
+                        auto pit = p->anims.find(kd.key);
+                        if (pit != p->anims.end() && !pit->second.empty()) chainAnims.push_back(&pit->second);
+                    }
+                }
+                if (!hasSelf && chainAnims.empty()) continue;
+                if (isXY && !chainAnims.empty()) {
+                    std::vector<float64> knots;
+                    auto collect = [&](const std::vector<RemJson::Anim>& as) {
+                        for (auto& a : as) {
+                            knots.push_back(beatToSec(a.start));
+                            knots.push_back(beatToSec(a.end));
+                        }
+                    };
+                    if (hasSelf) collect(it->second);
+                    for (auto* ca : chainAnims) collect(*ca);
+                    std::sort(knots.begin(), knots.end());
+                    knots.erase(std::unique(knots.begin(), knots.end(),
+                        [](float64 a, float64 b) { return std::fabs(a - b) < 1e-9; }), knots.end());
+                    auto combo = [&](float64 t2) {
+                        float64 v = 0.0;
+                        if (hasSelf) { auto r = evalAnims(it->second, t2); if (r.has) v += r.v; }
+                        for (auto* ca : chainAnims) { auto r = evalAnims(*ca, t2); if (r.has) v += r.v; }
+                        return v;
+                    };
+                    auto pushEvent = [&](float64 a, float64 b, float64 va, float64 vb, int64 easing) {
+                        MilEvent e {};
+                        e.type = kd.type;
+                        e.timeZone = { a, b };
+                        e.valueZone = { va * kd.scale + kd.bias, vb * kd.scale + kd.bias };
+                        attachEasing(e, easing);
+                        chart.animator.addEvent({ EnumMilObjectType::Line, thisLine }, e);
+                        nEvents++;
+                    };
+                    if (knots.size() == 1) {
+                        float64 v = combo(knots[0]);
+                        pushEvent(0.0, knots[0], v, v, 1);
+                        continue;
+                    }
+                    for (size_t i = 0; i + 1 < knots.size(); i++) {
+                        float64 t0 = knots[i], t1 = knots[i + 1];
+                        int64 easing = 1;
+                        if (hasSelf) easing = evalAnims(it->second, 0.5 * (t0 + t1)).easing;
+                        pushEvent(t0, t1, combo(t0), combo(t1), easing);
+                    }
+                    continue;
+                }
                 for (auto& ra : it->second) {
                     float64 a = beatToSec(ra.start), b = beatToSec(ra.end);
                     if (b < a) std::swap(a, b);
@@ -5703,12 +6037,15 @@ void main() {
             }
         }
 
+        // 线收尾: 排序音符 + 构建 noteGroups(无此步音符不进渲染管线, 与其他 loader 对齐)
+        for (auto& l : chart.lines) l.init(chart.animator);
+
         uint64 nNotes = 0;
         for (auto& l : chart.lines) nNotes += l.notes.size();
         std::fprintf(stderr,
-            "[REMJSON] 原生解析(胶水层): bpm=%.3f(变速点 %zu) 轨道=%zu 音符=%zu 事件=%llu 闪电跳过=%llu\n",
+            "[REMJSON] 原生解析(胶水层): bpm=%.3f(变速点 %zu) 轨道=%zu 音符=%zu 事件=%llu 闪电=%llu\n",
             rem.bpm, rem.bpmChanges.size(), chart.lines.size(), (size_t)nNotes,
-            (unsigned long long)nEvents, (unsigned long long)rem.nSkippedLightning);
+            (unsigned long long)nEvents, (unsigned long long)rem.nLightning);
         return chart;
     }
 
@@ -5872,6 +6209,12 @@ void main() {
     inline constexpr float64 introAftermath = 3.0;
     inline constexpr float64 introLeadTotal = 2.05 + 0.95 + 1.2 + introAftermath;   // introPreRoll + aftermath = 负时间总窗口 = BGM 静音前导
 
+    // [Reveal] 视频解锁演出(mil-reveal-1): 本家 PV 场景(Milthm.PV.PVController 反汇编 2026-10-22)通用化。
+    //   配置 = 谱面包 meta.json 的 "reveal" 键值对; 时间轴 = [-RD, 0), RD = BGM 全长。
+    //   本家机制: 视频 isPrepared 帧音乐起播(音频钟为准), CountDown=音乐Length-音乐Time, 视频播完
+    //   音乐继续放, 音乐停(或 musicAwaitTime 3s 兜底)→StartGame(Cutscene.Run→LaunchGameplay)。
+    //   reveal 启用时跳过开场信息页, 演出完直接进打歌。
+
     void calculateMilFrame(
         MilChart& chart, float64 time,
         const MilCalculateFrameConfig& config,
@@ -6009,7 +6352,7 @@ void main() {
                     .position = linePosition,
                     .scale = { lineSize, lineSize },
                     .size = lineHeadBase * config.lineHeadScale,
-                    .rotation = 180 - lineRotation,
+                    .rotation = lineRotation,
                     .color = lineColor.applyAlpha(lineHeadAlpha)
                 }, screenArea);
             }
@@ -6019,10 +6362,13 @@ void main() {
                 auto lineWidth = lineHeadBase * 0.096774;
                 frame.addObject(frame.cache.trackObjects, MilCalculatedFrame::CalculatedLineBody {
                     .origin = linePosition,
-                    .position = { connectRadius, -lineWidth / 2 },
+                    // 线体方向对齐 milplay drawLineState(ang=-LR, 从判定圈延伸):
+                    // GL 端 T·R(rotation)·矩形(-x 区间延伸), R(ρ)·(-1,0)=(-cosρ,-sinρ) 要等于
+                    // milplay 的 (cos(-LR),sin(-LR)) ⇒ ρ=180-LR。LR=90 时恒等 90, 竖直不变。
+                    .position = { -(connectRadius + config.screenSize.y * 2.5), -lineWidth / 2 },
                     .size = { config.screenSize.y * 2.5, lineWidth },
                     .scale = { lineSize, lineSize },
-                    .rotation = -lineRotation,
+                    .rotation = 180.0 - lineRotation,
                     .color = lineColor.applyAlpha(lineBodyAlpha)
                 }, screenArea);
             }
@@ -6244,6 +6590,9 @@ void main() {
 
                 for (uint64 layer = 0; layer < MilFxFxLayerCount; layer++) {
                     if (!milFxLayerEnabled[layer]) continue;
+                    // [反汇编 2026-10-17] 过线(Exact)只播 FracturePass; 四层是 Miss(FractureExplode) 特效,
+                    // 本渲染器无输入恒 AutoHit -> 门控在这里(数据仍全量构建, 供游玩器实现 Miss 时直接放开)
+                    if (layer != MilFxFxPass) continue;
                     auto& spec = milfx::kLayers[layer];
                     fxQuads.clear();
                     // 整体缩放: 乘在 pixelScale 上 -> 粒子尺寸/散布半径/位移同比例, originX/originY(判定点)不动
@@ -6619,6 +6968,496 @@ void main() {
         // introAftermath(收场后停留 3.0) / introLeadTotal(负时间总窗口) 在 namespace 顶层(本文件 calculateMilFrame 之前)
         inline static bool introEnabled = true;   // [CLI] --no-intro: 跳过开场信息页(渲染/计时/录制静音三处统一)
 
+        // [Reveal] mil-reveal-1 解锁演出(本家 Milthm.PV.PVController 反汇编 2026-10-22):
+        //   配置 = 谱面包 meta.json 的 "reveal" 键值对(见 docs/reveal-format.md);
+        //   本家时序(0x42cf074 Update / 0x42ceebc loopPointReached / 0x42cef58 StartGame):
+        //   视频 isPrepared → Music.Play 同帧起播 → CountDown=Music.Length-Time 每帧刷 →
+        //   视频播完只置 videoDone(音乐继续放) → 音乐 !IsPlaying 且未 loaded → StartGame(BlackLoading→打歌)。
+        //   时间轴: [-RD, 0), RD = BGM 全长; reveal 启用时跳过开场信息页, 视频完直接进打歌。
+        struct MilRevealConfig {
+            bool present = false;          // meta.json 带 "reveal" 键才启用
+            std::string videoFile;         // 包内相对路径, 必填(FFmpeg 软解 h264/hevc/av1/vp9)
+            std::string audioFile;         // 包内相对路径, 选填: PV 音频(与视频同帧起播; 本家 VideoPlayer+JuceAudio 分离)
+            float64 musicAwaitTime = 3.0;  // [本家] 音乐 !IsPlaying 累计兜底(CLI 时间轴不使用, 格式兼容保留)
+            bool uiCountdown = false;      // 右下角剩余时间(本家 CountDown anchor(1,0) pos(-122,101) size 127x90); 用户定调: 不显示
+        };
+        inline static bool revealEnabled = true;   // [CLI] --no-reveal
+        inline static bool revealRealTime = true;  // [CLI] --record/--screenshot 置 false → 同步解码(渲染线程逐帧推进)
+        MilRevealConfig revealConfig;
+        gsp<GL::TextureInfo> revealVidTex;         // 视频当前帧纹理(主线程惰性创建/重传)
+        gsp<DecodedAudio> revealAudio;             // PV 音频(包内 audioFile 解码; 与曲 BGM 分开, 不占 audioManager.load)
+        float64 revealAudioDur = 0.0;
+        gsp<AudioEngine::Task> revealAudioTask;    // GUI 实时播放用; 录制/截图(同步模式)不创建
+        gsp<DecodedAudio> revealSeAudio;           // [本家] StartGame 过场 SE(反汇编 SndPlayer.Play(-1.0,3); bundle TextAsset "sweet_dream_opening", 用户试听定案 2026-10-23)
+        float64 revealBaseDur = 0.0;               // = max(视频时长, PV 音频时长); SE 在此后响, 响完(RD)切打歌
+        bool revealSePlayed = false;
+
+        // RD = max(视频, PV 音频) + SE 尾段(用户定调 2026-10-23: 播完视频有音效才进谱); 都无时退回 BGM 全长
+        float64 revealDuration() {
+            if (!revealConfig.present || !revealEnabled) return 0.0;
+            float64 dur = revealBaseDur;
+            if (revealSeAudio) dur += revealSeAudio->getLengthInSeconds();
+            if (dur > 0.0) return dur;
+            return audioManager.getBgmLength();
+        }
+
+        // PV 音频实时播放(GUI): reveal 页首帧起播, 与视频同帧(本家 isPrepared → Music.Play 同帧)
+        void startRevealAudio() {
+            if (!revealAudio || revealAudioTask) return;
+            try { revealAudioTask = audioManager.engine->createTask(revealAudio); } catch (...) { revealAudioTask = nullptr; }
+        }
+        void stopRevealAudio() {
+            if (revealAudioTask) {
+                revealAudioTask->stopped = true;
+                revealAudioTask.reset();
+            }
+        }
+
+        // [Reveal] FFmpeg 视频软解: YUV420P/RGB24→RGBA(定点 BT.601), 双模式 ——
+        //   realTime(GUI 实时播放): 后台线程 + 有界帧队列, 主线程按音频钟取帧;
+        //   sync(--record/--screenshot): 渲染线程逐帧同步推进(pts 严格跟随 rt, 录制循环无实时时钟会跑赢解码线程)
+        struct MilRevealVideoDecoder {
+            struct Frame {
+                float64 pts = 0.0;
+                uint64 width = 0, height = 0;
+                std::vector<uint8> rgba;
+            };
+
+            ~MilRevealVideoDecoder() { stop(); }
+
+            void start(const std::string& videoPath) {
+                stop();
+                path = videoPath;
+                durationSec = 0.0;
+                // 探测时长(revealDuration 需在解码器激活前拿到 RD); 探完即关, 正式解码由 setup 重开
+                AVFormatContext* probe = nullptr;
+                if (avformat_open_input(&probe, videoPath.c_str(), nullptr, nullptr) >= 0 && avformat_find_stream_info(probe, nullptr) >= 0)
+                    durationSec = probe->duration > 0 ? probe->duration / (double)AV_TIME_BASE : 0.0;
+                else
+                    std::fprintf(stderr, "[reveal] video open failed: %s\n", videoPath.c_str());
+                if (probe) avformat_close_input(&probe);
+                std::lock_guard<std::mutex> lk(mtx);
+                queue.clear();
+                pendingValid = false;
+                eofDone = true;
+                failed = false;
+            }
+
+            void stop() {
+                running = false;
+                cvPush.notify_all();
+                if (worker.joinable()) worker.join();
+                std::lock_guard<std::mutex> lk(mtx);
+                queue.clear();
+                pendingValid = false;
+                teardown();
+                active = false;
+                eofDone = true;
+            }
+
+            bool started() const { return active; }
+            bool isFailed() const { return failed; }
+            float64 durationSec = 0.0;   // start() 时探测, revealDuration 用
+
+            // 消费 pts<=t 的帧到 out(保留最近一帧); realTime 见结构注释。返回是否拿到新帧
+            bool acquireFrameUpTo(float64 t, Frame& out, float64& lastPts, bool realTime) {
+                std::lock_guard<std::mutex> lk(mtx);
+                if (!active) {
+                    if (path.empty() || failed) return false;
+                    if (!setup()) return false;
+                    active = true;
+                    running = true;
+                    eofDone = false;
+                    if (realTime) worker = std::thread([this] { run(); });
+                }
+                if (!realTime) {
+                    // 同步模式: 无队列(整段视频全塞 queue 会堆 GB 级内存)。直解, 旧帧丢弃,
+                    // 超前帧存 pendingFrame 槽(单帧)供下个 tick 消费 — O(1) 内存
+                    if (pendingValid && pendingFrame.pts <= t) {
+                        out = std::move(pendingFrame);
+                        pendingValid = false;
+                        lastPts = out.pts;
+                        cvPush.notify_all();
+                        return true;
+                    }
+                    bool got = false;
+                    while (!eofDone) {
+                        // 已有未到期帧(pending.pts > t)时禁止继续超前解码:
+                        // 高帧率录制(tick 步长 < 视频帧间隔)下每 tick 都会再解一帧并覆盖
+                        // pending → "下一 tick 恰好该消费的那帧"被顶掉 → out 永远停在
+                        // 视频第 1 帧(黑帧) → reveal 段全程黑屏(2026-10-25 bot 1080p60 定案)
+                        if (pendingValid) break;
+                        Frame f;
+                        if (!decodeOneFrame(f)) break;
+                        if (f.pts <= t) { out = std::move(f); got = true; }
+                        else { pendingFrame = std::move(f); pendingValid = true; break; }
+                    }
+                    if (got) lastPts = out.pts;
+                    cvPush.notify_all();
+                    return got;
+                }
+                bool got = false;
+                while (!queue.empty() && queue.front().pts <= t) {
+                    out = std::move(queue.front());
+                    queue.pop_front();
+                    got = true;
+                }
+                if (got) lastPts = out.pts;
+                cvPush.notify_all();
+                return got;
+            }
+
+            private:
+            bool setup() {
+                if (avformat_open_input(&fmt, path.c_str(), nullptr, nullptr) < 0) { failed = true; return false; }
+                if (avformat_find_stream_info(fmt, nullptr) < 0
+                    || (vIdx = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0)) < 0) { teardown(); failed = true; return false; }
+                const AVCodec* codec = avcodec_find_decoder(fmt->streams[vIdx]->codecpar->codec_id);
+                cc = codec ? avcodec_alloc_context3(codec) : nullptr;
+                if (!cc || avcodec_parameters_to_context(cc, fmt->streams[vIdx]->codecpar) < 0 || avcodec_open2(cc, codec, nullptr) < 0) {
+                    teardown(); failed = true; return false;
+                }
+                pkt = av_packet_alloc();
+                frm = av_frame_alloc();
+                if (!pkt || !frm) { teardown(); failed = true; return false; }
+                tb = fmt->streams[vIdx]->time_base;
+                return true;
+            }
+
+            void teardown() {
+                if (frm) av_frame_free(&frm);
+                if (pkt) av_packet_free(&pkt);
+                if (cc) avcodec_free_context(&cc);
+                if (fmt) avformat_close_input(&fmt);
+                eofSent = false;
+                pendingPacket = false;
+            }
+
+            // 解一帧到 f(不碰 queue; 调用方独占 codec 状态); 返回 false = EOF/错误
+            // ⚠ receive 优先; send EAGAIN(解码器延迟输出, 输入缓冲满)时重试同一 pkt, 不丢包
+            // ⚠ 2026-10-24: demuxer 会对首包(编辑列表负 pts)误标 AV_PKT_FLAG_CORRUPT → h264 send 直接
+            //    INVALIDDATA, 整段视频一帧都出不来(症状 = reveal 全黑)。剥标志 + send 失败跳包不致命。
+            bool decodeOneFrame(Frame& f) {
+                int sendFails = 0;
+                while (true) {
+                    int ret = avcodec_receive_frame(cc, frm);
+                    if (ret == 0) {
+                        f.pts = frm->pts * av_q2d(tb);
+                        convertFrame(*frm, f);
+                        av_frame_unref(frm);
+                        return true;
+                    }
+                    if (ret == AVERROR_EOF) { eofDone = true; return false; }
+                    if (ret != AVERROR(EAGAIN)) { eofDone = true; return false; }
+                    if (pendingPacket) {
+                        if (pkt) pkt->flags &= ~(int)AV_PKT_FLAG_CORRUPT;   // demuxer 误标
+                        ret = avcodec_send_packet(cc, pkt);
+                        if (ret == 0) { pendingPacket = false; sendFails = 0; }
+                        else if (ret == AVERROR(EAGAIN)) { /* 收满, 下轮 receive 排空 */ }
+                        else {
+                            if (pkt) av_packet_unref(pkt);
+                            pendingPacket = false;
+                            if (++sendFails > 50) { eofDone = true; return false; }
+                        }
+                    } else if (!eofSent) {
+                        // ⚠ 2026-10-24: av_read_frame 返回所有流(音频/数据包也在内), 必须按 stream_index
+                        //    过滤后才能 send 给视频解码器, 否则音频包 → h264 send = AVERROR_INVALIDDATA
+                        bool gotVideo = false;
+                        while (!gotVideo) {
+                            ret = av_read_frame(fmt, pkt);
+                            if (ret < 0) { eofSent = true; break; }
+                            if (pkt->stream_index == vIdx) gotVideo = true;
+                            else av_packet_unref(pkt);
+                        }
+                        pendingPacket = gotVideo;
+                    } else {
+                        ret = avcodec_send_packet(cc, nullptr);   // flush → receive 排空至 EOF
+                        if (ret < 0 && ret != AVERROR(EAGAIN)) { eofDone = true; return false; }
+                    }
+                }
+            }
+
+            void run() {
+                try {
+                    while (running) {
+                        {
+                            std::unique_lock<std::mutex> lk(mtx);
+                            cvPush.wait(lk, [&] { return !running || queue.size() < maxFrames; });
+                            if (!running) break;
+                        }
+                        Frame f;
+                        if (!decodeOneFrame(f)) break;
+                        std::lock_guard<std::mutex> lk(mtx);
+                        queue.push_back(std::move(f));
+                    }
+                } catch (const std::exception&) { std::lock_guard<std::mutex> lk(mtx); failed = true; }
+                catch (...) { std::lock_guard<std::mutex> lk(mtx); failed = true; }
+                std::lock_guard<std::mutex> lk(mtx);
+                eofDone = true;
+            }
+
+            static void convertFrame(AVFrame& frm, Frame& out) {
+                const int w = frm.width, h = frm.height;
+                out.width = (uint64)w; out.height = (uint64)h;
+                out.rgba.resize((size_t)w * h * 4);
+                const auto fmtId = (AVPixelFormat)frm.format;
+                if (fmtId == AV_PIX_FMT_YUV420P || fmtId == AV_PIX_FMT_YUVJ420P) {
+                    const bool full = (fmtId == AV_PIX_FMT_YUVJ420P);
+                    // 定点 BT.601(<<10): limited Y=1.164/U=1.596/V=2.017(跨 0.392/0.813); full 直通
+                    const uint8* Y = frm.data[0];
+                    const uint8* U = frm.data[1];
+                    const uint8* V = frm.data[2];
+                    const int yLs = frm.linesize[0], cLs = frm.linesize[1];
+                    for (int y = 0; y < h; y++) {
+                        const uint8* yrow = Y + (size_t)y * yLs;
+                        const uint8* urow = U + (size_t)(y >> 1) * cLs;
+                        const uint8* vrow = V + (size_t)(y >> 1) * cLs;
+                        uint8* dst = &out.rgba[(size_t)y * w * 4];
+                        for (int x = 0; x < w; x++) {
+                            int r, g, b;
+                            if (full) {
+                                int yy = yrow[x], uu = urow[x >> 1] - 128, vv = vrow[x >> 1] - 128;
+                                r = yy + (1436 * vv >> 10);
+                                g = yy - (352 * uu >> 10) - (731 * vv >> 10);
+                                b = yy + (1815 * uu >> 10);
+                            } else {
+                                int yy = yrow[x] - 16, uu = urow[x >> 1] - 128, vv = vrow[x >> 1] - 128;
+                                r = (1192 * yy + 1634 * vv + 512) >> 10;
+                                g = (1192 * yy - 401 * uu - 832 * vv + 512) >> 10;
+                                b = (1192 * yy + 2066 * uu + 512) >> 10;
+                            }
+                            dst[x * 4 + 0] = (uint8)std::clamp(r, 0, 255);
+                            dst[x * 4 + 1] = (uint8)std::clamp(g, 0, 255);
+                            dst[x * 4 + 2] = (uint8)std::clamp(b, 0, 255);
+                            dst[x * 4 + 3] = 255;
+                        }
+                    }
+                } else if (fmtId == AV_PIX_FMT_RGB24 || fmtId == AV_PIX_FMT_BGR24) {
+                    const bool rgb = (fmtId == AV_PIX_FMT_RGB24);
+                    const uint8* src = frm.data[0];
+                    const int ls = frm.linesize[0];
+                    for (int y = 0; y < h; y++) {
+                        const uint8* row = src + (size_t)y * ls;
+                        uint8* dst = &out.rgba[(size_t)y * w * 4];
+                        for (int x = 0; x < w; x++) {
+                            dst[x * 4 + 0] = rgb ? row[x * 3 + 0] : row[x * 3 + 2];
+                            dst[x * 4 + 1] = row[x * 3 + 1];
+                            dst[x * 4 + 2] = rgb ? row[x * 3 + 2] : row[x * 3 + 0];
+                            dst[x * 4 + 3] = 255;
+                        }
+                    }
+                } else {
+                    throw std::runtime_error("reveal video: unsupported pixel format (use yuv420p)");
+                }
+            }
+
+            public:
+            // [Reveal] meta 无 audio 时从视频文件解出音轨当 PV 音频(交错 s16, 原采样率/声道)。
+            // avformat 只解封装; AAC 走 fdk(裸包手动补 ADTS 头, 原型见文件头 extern "C"), 其他编码仍试 avcodec
+            static gsp<DecodedAudio> decodeAudioTrack(const std::string& path) {
+                AVFormatContext* fmt = nullptr;
+                if (avformat_open_input(&fmt, path.c_str(), nullptr, nullptr) < 0) return nullptr;
+                if (avformat_find_stream_info(fmt, nullptr) < 0) { avformat_close_input(&fmt); return nullptr; }
+                int aIdx = av_find_best_stream(fmt, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
+                if (aIdx < 0) { avformat_close_input(&fmt); return nullptr; }
+                AVCodecParameters* par = fmt->streams[aIdx]->codecpar;
+                const bool isAac = par->codec_id == AV_CODEC_ID_AAC;
+                if (isAac && (par->extradata_size < 2 || !par->extradata)) { avformat_close_input(&fmt); return nullptr; }
+                // AudioSpecificConfig 头 5+4+3 bit: AOT / 采样率索引 / 声道配置 → ADTS 头用
+                int aot = isAac ? (par->extradata[0] >> 3) : 0;
+                int srIdx = isAac ? (((par->extradata[0] & 7) << 1) | (par->extradata[1] >> 7)) : 0;
+                int chCfg = isAac ? ((par->extradata[1] >> 3) & 0xF) : 0;
+                int adtsProfile = aot - 1;
+                if (isAac && (adtsProfile < 0 || adtsProfile > 3 || srIdx > 12 || chCfg < 1)) {
+                    avformat_close_input(&fmt);
+                    return nullptr;
+                }
+                auto out = DecodedAudio::Make();
+                AVPacket* pkt = av_packet_alloc();
+                if (isAac) {
+                    auto dec = aacDecoder_Open(2 /*TT_MP4_ADTS, 勿传 0=RAW*/, 1);
+                    if (!dec) { av_packet_free(&pkt); avformat_close_input(&fmt); return nullptr; }
+                    std::vector<unsigned char> frameBuf;
+                    std::vector<int16> pcm(16384);   // 2048 samples x 8ch 足够
+                    unsigned int ch = 0, sr = 0;
+                    while (true) {
+                        int r2 = av_read_frame(fmt, pkt);
+                        if (r2 < 0) break;
+                        if (pkt->stream_index != aIdx || pkt->size <= 0) { av_packet_unref(pkt); continue; }   // 必须按 stream_index 过滤(与视频流同坑)
+                        bool alreadyAdts = pkt->data[0] == 0xFF && (pkt->data[1] & 0xF6) == 0xF0;
+                        if (alreadyAdts) {
+                            frameBuf.assign(pkt->data, pkt->data + pkt->size);
+                        } else {
+                            const unsigned int frameLen = (unsigned int)pkt->size + 7;
+                            frameBuf.resize(frameLen);
+                            frameBuf[0] = 0xFF; frameBuf[1] = 0xF1;   // sync + MPEG4/无CRC
+                            frameBuf[2] = (unsigned char)((adtsProfile << 6) | (srIdx << 2) | ((chCfg >> 2) & 1));
+                            frameBuf[3] = (unsigned char)(((chCfg & 3) << 6) | ((frameLen >> 11) & 3));
+                            frameBuf[4] = (unsigned char)((frameLen >> 3) & 0xFF);
+                            frameBuf[5] = (unsigned char)(((frameLen & 7) << 5) | 0x1F);   // buffer fullness 0x7FF
+                            frameBuf[6] = 0xFC;
+                            std::copy(pkt->data, pkt->data + pkt->size, frameBuf.begin() + 7);
+                        }
+                        unsigned char* fbPtr = frameBuf.data();
+                        unsigned int fbSize = (unsigned int)frameBuf.size();
+                        unsigned int valid = fbSize;
+                        aacDecoder_Fill(dec, &fbPtr, &fbSize, &valid);
+                        unsigned int info[64] = {};
+                        unsigned int fch = 0, fsr = 0, fsamples = 0;
+                        if (aacDecoder_DecodeFrame(dec, pcm.data(), (unsigned int)pcm.size(), info) == 0) {   // AAC_DEC_OK = 0
+                            // 帧信息优先取 GetStreamInfo(CStreamInfo 前 3 字段: sampleRate/frameSize/numChannels, 跨版本稳定)
+                            const unsigned int* si = aacDecoder_GetStreamInfo(dec);
+                            if (si) { fsr = si[0]; fsamples = si[1]; fch = si[2]; }
+                            else   { fch = info[0]; fsr = info[1]; fsamples = info[2]; }
+                            if (ch == 0) { ch = fch; sr = fsr; out->channels = fch; out->sampleRate = fsr; }
+                            if (fch == ch && fsr == sr) {
+                                out->data.insert(out->data.end(), pcm.begin(), pcm.begin() + (size_t)fsamples * fch);
+                            }
+                            // else: SBR 切换等中帧参数漂移, 丢弃该帧
+                        }
+                        av_packet_unref(pkt);
+                    }
+                    aacDecoder_Close(dec);
+                } else {
+                    const AVCodec* codec = avcodec_find_decoder(par->codec_id);
+                    AVCodecContext* cc = codec ? avcodec_alloc_context3(codec) : nullptr;
+                    if (!cc || avcodec_parameters_to_context(cc, par) < 0 || avcodec_open2(cc, codec, nullptr) < 0) {
+                        if (cc) avcodec_free_context(&cc);
+                        av_packet_free(&pkt);
+                        avformat_close_input(&fmt);
+                        return nullptr;
+                    }
+                    out->channels = (uint64)std::max(1, cc->ch_layout.nb_channels);
+                    out->sampleRate = (uint64)std::max(1, cc->sample_rate);
+                    AVFrame* frm = av_frame_alloc();
+                    bool eofSent = false;
+                    auto appendFrame = [&](AVFrame& f) {
+                        const int ch = (int)out->channels;
+                        const int n = f.nb_samples;
+                        const auto sf = (AVSampleFormat)f.format;
+                        const bool planar = av_sample_fmt_is_planar(sf) != 0;
+                        const int srcCh = std::max(1, planar ? ch : (int)(f.ch_layout.nb_channels > 0 ? f.ch_layout.nb_channels : ch));
+                        size_t base = out->data.size();
+                        out->data.resize(base + (size_t)n * ch);
+                        for (int i = 0; i < n; i++) {
+                            for (int c = 0; c < ch; c++) {
+                                float v = 0.0f;
+                                if (sf == AV_SAMPLE_FMT_FLT || sf == AV_SAMPLE_FMT_FLTP) {
+                                    v = planar ? ((const float*)f.data[c])[i] : ((const float*)f.data[0])[(size_t)i * srcCh + c];
+                                } else if (sf == AV_SAMPLE_FMT_S16 || sf == AV_SAMPLE_FMT_S16P) {
+                                    v = (planar ? ((const int16*)f.data[c])[i] : ((const int16*)f.data[0])[(size_t)i * srcCh + c]) / 32768.0f;
+                                } else if (sf == AV_SAMPLE_FMT_S32 || sf == AV_SAMPLE_FMT_S32P) {
+                                    v = (planar ? ((const int32*)f.data[c])[i] : ((const int32*)f.data[0])[(size_t)i * srcCh + c]) / 2147483648.0f;
+                                } else return;   // 未知格式: 丢弃该帧
+                                out->data[base + (size_t)i * ch + c] = (int16)std::clamp(v * 32767.0f, -32768.0f, 32767.0f);
+                            }
+                        }
+                    };
+                    while (true) {
+                        int ret = avcodec_receive_frame(cc, frm);
+                        if (ret == 0) { appendFrame(*frm); av_frame_unref(frm); continue; }
+                        if (ret == AVERROR_EOF) break;
+                        if (ret != AVERROR(EAGAIN)) break;
+                        if (eofSent) break;
+                        int r2 = av_read_frame(fmt, pkt);
+                        if (r2 < 0) { if (avcodec_send_packet(cc, nullptr) < 0) break; eofSent = true; continue; }
+                        if (pkt->stream_index != aIdx) { av_packet_unref(pkt); continue; }   // 与视频流同坑: 必须按 stream_index 过滤
+                        if (avcodec_send_packet(cc, pkt) < 0) { av_packet_unref(pkt); continue; }
+                        av_packet_unref(pkt);
+                    }
+                    av_frame_free(&frm);
+                    avcodec_free_context(&cc);
+                }
+                av_packet_free(&pkt);
+                avformat_close_input(&fmt);
+                if (out->data.empty()) return nullptr;
+                return out;
+            }
+
+            std::thread worker;
+            std::mutex mtx;
+            std::condition_variable cvPush;
+            std::deque<Frame> queue;
+            size_t maxFrames = 8;
+            std::string path;
+            AVFormatContext* fmt = nullptr;
+            AVCodecContext* cc = nullptr;
+            AVPacket* pkt = nullptr;
+            AVFrame* frm = nullptr;
+            int vIdx = -1;
+            AVRational tb { 1, 30 };
+            bool running = false, eofDone = true, eofSent = false, failed = false, active = false, pendingPacket = false;
+            Frame pendingFrame;          // sync 模式超前帧槽(已解出但 pts>t, 下个 tick 消费)
+            bool pendingValid = false;
+        };
+        MilRevealVideoDecoder revealVideo;
+        MilRevealVideoDecoder::Frame revealVidFrame;   // 主线程最近一帧
+        float64 revealVidPts = -1.0;
+
+        // 从谱面资产目录读 meta.json 的 "reveal" 键(无 meta.json / 无该键 / fmt 不符 = 无演出, 静默返回)
+        void loadRevealFromMeta(const std::string& dir) {
+            auto dbgLog = [](const char* tag, const std::string& s) {
+                if (FILE* f = fopen("E:/tmp/reveal_rt.log", "a")) { fprintf(f, "[%s] %s\n", tag, s.c_str()); fclose(f); }
+            };
+            dbgLog("load", "dir=" + dir);
+            revealVideo.stop();
+            revealVidFrame = MilRevealVideoDecoder::Frame {};
+            revealVidPts = -1.0;
+            revealVidTex = nullptr;
+            stopRevealAudio();
+            revealAudio = nullptr;
+            revealAudioDur = 0.0;
+            revealSeAudio = nullptr;
+            revealBaseDur = 0.0;
+            revealSePlayed = false;
+            revealConfig = MilRevealConfig {};
+            if (dir.empty()) return;
+            Data d;
+            try { d = Data::MakeFromFile(dir + "/meta.json"); } catch (...) { dbgLog("load", "meta.json read FAIL"); return; }
+            auto metaRoot = gjson::JsonNode::Parse(d);
+            if (!metaRoot.isObject() || !metaRoot.hasKey("reveal") || !metaRoot["reveal"].isObject()) { dbgLog("load", "no reveal key"); return; }
+            auto& root = metaRoot["reveal"];
+            if (!root.hasKey("fmt") || !root["fmt"].isString() || root["fmt"].getString() != "mil-reveal-1") { dbgLog("load", "fmt mismatch"); return; }
+            auto str = [](JsonNode& n, const char* k) -> std::string {
+                if (n.hasKey(k) && n[k].isString()) return n[k].getString();
+                return {};
+            };
+            revealConfig.videoFile = str(root, "video");
+            revealConfig.audioFile = str(root, "audio");
+            if (root.hasKey("ui") && root["ui"].isObject()) {
+                auto& ui = root["ui"];
+                if (ui.hasKey("countdown") && ui["countdown"].isBool()) revealConfig.uiCountdown = ui["countdown"].getBool();
+            }
+            if (root.hasKey("timing") && root["timing"].isObject()) {
+                auto& tm = root["timing"];
+                if (tm.hasKey("musicAwaitTime") && tm["musicAwaitTime"].isNumber())
+                    revealConfig.musicAwaitTime = std::max(0.0, tm["musicAwaitTime"].getNumber());
+            }
+            revealConfig.present = true;
+            dbgLog("load", "video=" + revealConfig.videoFile + " audio=" + revealConfig.audioFile);
+            if (!revealConfig.videoFile.empty())
+                revealVideo.start(dir + "/" + revealConfig.videoFile);
+            dbgLog("load", "probe durationSec=" + std::to_string(revealVideo.durationSec));
+            if (!revealConfig.audioFile.empty()) {
+                try {
+                    revealAudio = audioManager.decodeAndCheck(Data::MakeFromFile(dir + "/" + revealConfig.audioFile));
+                    revealAudioDur = revealAudio->getLengthInSeconds();
+                } catch (...) { revealAudio = nullptr; revealAudioDur = 0.0; }
+            } else if (!revealConfig.videoFile.empty()) {
+                // [Reveal] meta 无 audio 时从视频音轨取 PV 音频(与视频同帧起播; GUI 实时与 record 混音共用)
+                try {
+                    revealAudio = MilRevealVideoDecoder::decodeAudioTrack(dir + "/" + revealConfig.videoFile);
+                    revealAudioDur = revealAudio ? revealAudio->getLengthInSeconds() : 0.0;
+                } catch (...) { revealAudio = nullptr; revealAudioDur = 0.0; }
+                dbgLog("load", std::string("audio fallback from video: ") + (revealAudio ? ("ok " + std::to_string(revealAudioDur) + "s") : "none"));
+            }
+            revealBaseDur = std::max(
+                (!revealConfig.videoFile.empty() && revealVideo.durationSec > 0.0) ? revealVideo.durationSec : 0.0,
+                revealAudioDur);
+            // [本家] StartGame 过场 SE(embed 资源, 缺失 = 静默无尾段)
+            try { revealSeAudio = audioManager.decodeAndCheck(Data::MakeFromGrain("geasy_phi/milthm/se/sweet_dream_opening.ogg")); } catch (...) { revealSeAudio = nullptr; }
+        }
+
         gsp<GL::TextureInfo> introJacketTex;
         gsp<GL::TextureInfo> introJacketGrayTex;    // 灰度副本: 本家 bg 材质 PlayLoadingBackground = Custom/Grayscale(_Saturation=0), 灰度曲绘 × _Color(58/255)
         gsp<DecodedRGBATexture> introCoverDecoded;  // loadIllustion 保留的解码像素(开场页灰度背景用; zip/对话框/milcharts 全流程统一)
@@ -6725,6 +7564,89 @@ void main() {
 
         // 载入信息页绘制; t = introTime ∈ [0, introPreRoll)
         // 三阶段: [0,2.05) 进场 18 步 / [2.05,3.98) 静止数据布局(参考帧 s/001) / [3.98,4.98) FinishAnimation 退场
+        // [Reveal] 解锁演出页绘制; rt = reveal 本地时间 ∈ [0, RD)
+        // 视觉骨架对齐本家 PV 场景(level5 bundle 反序列化): 黑底 → 背景淡入 → 标题揭示(TitleArt)
+        //   → 右下 CountDown → 淡出衔接开场信息页。布局常量来自 level5 RectTransform 反序列化(2026-10-22)。
+        // [Reveal] 解锁演出页(rt = reveal 本地时间 ∈ [0, RD)); 黑底 + 全屏视频 + 底部进度条(滚动加载感);
+        // CountDown 默认不画(用户定调), meta ui.countdown=true 才显示
+        void drawMilRevealPage(GL::GL33Canvas& cvs, float64 rt, bool realTime) {
+            using namespace GL;
+            const MilRevealConfig& rc = revealConfig;
+            const float64 RD = revealDuration();
+            auto S = calcConfig.screenSize;
+            const float64 W = S.x, H = S.y;
+
+            // PV 音频与视频同帧起播(本家 isPrepared → Music.Play 同帧; 仅 GUI 实时路径)
+            if (realTime) startRevealAudio();
+            // [本家] 视频/PV 音频放完(revealBaseDur) → StartGame 过场 SE, 响完(RD)切打歌
+            if (realTime && revealSeAudio && !revealSePlayed && rt >= revealBaseDur) {
+                revealSePlayed = true;
+                audioManager.playSfx(revealSeAudio, 1);
+            }
+
+            // 黑底(本家 PV 场景底色; 视频未 prepared/结束后由最后帧或黑覆盖)
+            cvs.drawRect({ .position = { 0.0, 0.0 }, .size = { W, H }, .color = Color { 0.0, 0.0, 0.0, 1.0 } });
+
+            // 视频帧: 取 pts<=rt 最近帧, cover 等比铺满; 播完停最后帧(本家 loopPointReached 不清画面)
+            if (!rc.videoFile.empty()) revealVideo.acquireFrameUpTo(rt, revealVidFrame, revealVidPts, realTime);
+            if (revealVidFrame.width > 0 && revealVidFrame.rgba.size() == revealVidFrame.width * revealVidFrame.height * 4) {
+                // 每帧无条件重传(帧 pts 未变时跳过 GPU 侧已无收益, 直接传最稳)
+                if (!revealVidTex) revealVidTex = glCtx->createTexture();
+                if (revealVidTex) {
+                    revealVidTex->use().image2D((GLsizei)revealVidFrame.width, (GLsizei)revealVidFrame.height, revealVidFrame.rgba.data(), false);
+                }
+            }
+            if (revealVidTex && revealVidPts >= 0.0) {
+                float64 texAspect = (float64)revealVidTex->width / revealVidTex->height;
+                float64 scrAspect = W / H;
+                float64 dw, dh;
+                if (texAspect > scrAspect) { dh = H; dw = H * texAspect; }
+                else { dw = W; dh = W / texAspect; }
+                cvs.drawRect({
+                    .position = { (W - dw) / 2.0, (H - dh) / 2.0 },
+                    .size = { dw, dh },
+                    .color = Color::White(),
+                    .texture = revealVidTex.get()
+                });
+            }
+
+            // [本家 Cutscene.BlackLoading] 视频/PV音频完(revealBaseDur) → 黑场淡入(AniInSpeed)盖住视频最后帧;
+            // SE 与黑场同帧起(StartGame = SndPlayer.Play + Cutscene.Run 同帧)
+            if (rt > revealBaseDur) {
+                float64 a = std::clamp((rt - revealBaseDur) / 1.0, 0.0, 1.0);
+                if (a > 0.0) cvs.drawRect({ .position = { 0.0, 0.0 }, .size = { W, H }, .color = Color { 0.0, 0.0, 0.0, a } });
+            }
+
+            // 底部进度条(与打歌页同款 progressbarTex): rt/RD 滚动, 视频+音频加载感
+            if (RD > 0.0 && progressbarTex) {
+                cvs.drawRect({
+                    .position = { 0.0, 0.0 },
+                    .size = { std::clamp(rt / RD, 0.0, 1.0) * W, W * 0.0046875 },
+                    .color = Color::White(),
+                    .texture = progressbarTex.get()
+                });
+            }
+
+            // CountDown(本家: 每帧 CountDown.text = (Length - Time) → 音乐剩余秒; anchor(1,0) pos(-122,101))
+            // 用户定调: 默认不显示, meta ui.countdown=true 才开
+            if (rc.uiCountdown) {
+                float64 remain = std::max(0.0, RD - rt);
+                int sec = (int)remain;
+                char buf[32];
+                std::snprintf(buf, sizeof(buf), "%d:%02d", sec / 60, sec % 60);
+                TextManager::DrawTextConfig cfg {
+                    .text = buf,
+                    .fontSize = W * 0.030,
+                    .pos = { W - 122.0 / 1920.0 * W, 101.0 / 1080.0 * H },
+                    .anchor = { 1.0, 0.0 },
+                    .rotation = 0.0,
+                    .scale = { 1.0, 1.0 },
+                    .color = Color::White()
+                };
+                textManager.drawText(cvs, cfg);
+            }
+        }
+
         void drawMilIntroPage(GL::GL33Canvas& cvs, float64 t) {
             using namespace GL;
             auto S = calcConfig.screenSize;
@@ -6782,15 +7704,19 @@ void main() {
             // 进场 MBackOut: 0 → 0.45 回弹; 退场 Milease: 0.45 → 0 (Vector3.zero, 0.25s Quad+In)
             float64 cardScale = eOutBack(a);
             if (exitT > 0.0) cardScale *= (1.0 - exitSmall);
-            const Vec2 cardCenter { 0.4996 * W, 0.4279 * H };
+            // 方形曲绘走 SquareJacket 形态(prefab 真源: Jacket 图像 rect 1920x1080 vs SquareJacket 1080x1080
+            //   ⇒ 尺寸比 0.5625; 中心 aPos y 99 vs 57 ⇒ 高 42 canvas px = 42*0.45/1080 = 0.0175H)。
+            //   无方形参考帧(s/ 段仅 4 帧且非方形), 尺寸/中心由 prefab 等比推出; 判定用纹理宽高比 1:1。
+            const float64 cardAspect = (jacket && jacket->height > 0)
+                ? (float64)jacket->width / jacket->height
+                : (16.0 / 9.0);
+            const bool squareForm = cardAspect > 0.98 && cardAspect < 1.02;
+            const Vec2 cardCenter { 0.4996 * W, 0.4279 * H - (squareForm ? 0.0175 * H : 0.0) };
             // 卡片尺寸必须保持曲绘原始宽高比(否则非 16:9 屏幕下曲绘被非等比拉伸:
             //   旧式 {0.4320*W, 0.4223*H} 两个系数独立按 W/H 缩放 → 卡片比 = 1.0230*screenRatio,
             //   21:9 卡片比 2.42 vs 曲绘 1.7778 ⇒ 横向拉 36%; 4:3 ⇒ 纵向拉 25%)。
             //   宽度沿用参考帧(1280x720)实测基准 0.4320*W, 高度由曲绘纹理原始比例推出 ⇒ 永远等比。
-            const float64 cardAspect = (jacket && jacket->height > 0)
-                ? (float64)jacket->width / jacket->height
-                : (16.0 / 9.0);
-            const float64 cardW = 0.4320 * W * cardScale;
+            const float64 cardW = 0.4320 * W * (squareForm ? 1080.0 / 1920.0 : 1.0) * cardScale;
             const Vec2 cardSize { cardW, cardW / cardAspect };
             const float64 cardRadius = 0.022 * H;   // 参考帧卡片圆角
 
@@ -6963,6 +7889,7 @@ void main() {
             introJacketTex = nullptr;
             introJacketGrayTex = nullptr;
             introBgBaked = false;
+            revealVidTex = nullptr;   // [Reveal] 视频帧纹理失效(重传)
         }
 
         TakeOvererComponents::LoadChartResultInfo loadChart(const LoadChartConfig& config) {
@@ -7083,7 +8010,25 @@ void main() {
             // [Intro] t < 0 = 载入信息页阶段(选歌后/进游玩前): 只画该页, 不画打歌内容
             // 反汇编依据见 remtest/opening_animation_re.md (Awake 18 步 ≈2.05s)
             // [-introAftermath, 0) = 本家收场后停留: 游戏画面 + 进度条从头滚到底, 落到下方正常渲染
-            if (introEnabled && t < -introAftermath) {
+            // [Reveal] [-RD, 0) = 解锁演出段(mil-reveal-1); reveal 启用时跳过开场信息页, 视频完直接进打歌
+            //   (本家 StartGame = BlackLoading → LaunchGameplay, 不经过信息页)
+            const float64 revealDur = revealDuration();
+            if (revealDur > 0.0) {
+                if (t < 0.0) {
+                    glCtx->setViewport(calcConfig.screenSize.x, calcConfig.screenSize.y);
+                    glCtx->gl.glClearColor(0.0, 0.0, 0.0, 1.0);
+                    glCtx->gl.glClear(GL::GL_COLOR_BUFFER_BIT);
+                    auto revealCvs = GL::GL33Canvas::Make(glCtx.get());
+                    drawMilRevealPage(revealCvs, std::clamp(t + revealDur, 0.0, revealDur), revealRealTime);
+                    if (renderConfig.base.flushGl) glCtx->gl.glFlush();
+                    return renderResultInfoCache;
+                }
+                stopRevealAudio();   // reveal 段结束(t>=0), 停 PV 音频(首次调用后为空操作)
+                if (revealRealTime && revealSeAudio && !revealSePlayed) {   // SE 兜底(异常跳帧时)
+                    revealSePlayed = true;
+                    audioManager.playSfx(revealSeAudio, 1);
+                }
+            } else if (introEnabled && t < -introAftermath) {
                 glCtx->setViewport(calcConfig.screenSize.x, calcConfig.screenSize.y);
                 glCtx->gl.glClearColor(0.0, 0.0, 0.0, 1.0);
                 glCtx->gl.glClear(GL::GL_COLOR_BUFFER_BIT);
@@ -7290,6 +8235,13 @@ void main() {
                 .color = Color::White(),
                 .texture = progressbarTex.get()
             });
+
+            // [本家 Cutscene.BlackLoading] 黑场淡出(AniOutSpeed=1.0, 反汇编 FadeOutAnimation):
+            // reveal 进打歌后黑底逐渐消失露出谱面(用户 2026-10-24 指出)
+            if (revealConfig.present && revealEnabled && revealDur > 0.0 && t >= 0.0 && t < 1.0) {
+                auto S = calcConfig.screenSize;
+                cvs.drawRect({ .position = { 0.0, 0.0 }, .size = { S.x, S.y }, .color = Color { 0.0, 0.0, 0.0, 1.0 - std::clamp(t, 0.0, 1.0) } });
+            }
 
             if (renderConfig.base.flushGl) {
                 glCtx->gl.glFlush();
@@ -7541,7 +8493,7 @@ void main() {
         bool isLinear = true;
 
         void loadFromType(uint64 type) {
-            if (type <= 0 || type > 14) return;
+            if (type <= 0 || type > 18) return;
             
             context = (void*)type;
             func = [](void* ctx, float64 p) { return EaseSet::Rizline::Official::easing((uint64)ctx, p); };

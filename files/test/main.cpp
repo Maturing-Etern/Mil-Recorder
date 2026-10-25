@@ -161,10 +161,8 @@ namespace test_main {
     // 避免 CLI(--screenshot/--record/--dumpmil/zip 播放)逐个弹窗。
     void createGLfwWindow(WindowBase& wbase, bool hidden = false) {
         wbase.window = gglfw3::Window::Make();
-        std::fprintf(stderr, "[probe-eg] AFTER Make\n");
         if (hidden) wbase.window->setHidden(true);
         wbase.window->hint330Core()->hintMsaa(4);
-        std::fprintf(stderr, "[probe-eg] BEFORE setSizeOfMonitor\n");
         if (wbase.fullscreen) wbase.window->setFullscreen();
         else {
             wbase.window->setSizeOfMonitor(0.6);
@@ -175,13 +173,9 @@ namespace test_main {
             }
         }
 
-        std::fprintf(stderr, "[probe-eg] BEFORE create\n");
         wbase.window->create();
-        std::fprintf(stderr, "[probe-eg] AFTER create\n");
-        std::fprintf(stderr, "[probe-eg] BEFORE GL33Make\n");
         wbase.glCtx = GL33Context::Make(MakeGL33CoreInterface(gglfw3::getProcAddress));
-        std::fprintf(stderr, "[probe-eg] AFTER GL33Make\n");
-        
+
         wbase.window->mouseButtonCallback = [wbase = &wbase](int button, int action, int mods) {
             if (action == GLFW_PRESS) {
                 if (button == GLFW_MOUSE_BUTTON_RIGHT) {
@@ -192,8 +186,6 @@ namespace test_main {
                 }
             }
         };
-
-            std::fprintf(stderr, "[probe-eg] FUNC-TAIL\n");
     }
 
     struct PhiWindow {
@@ -378,7 +370,6 @@ namespace test_main {
         void init(bool hidden = false) {
             std::fprintf(stderr, "[dbg init] createGLfwWindow...\n");
             createGLfwWindow(base, hidden);
-            std::fprintf(stderr, "[probe-eg] RET-createGLfwWindow\n");
             std::fprintf(stderr, "[dbg init] window ok, MilTakeOverer::Make...\n");
 
             renderer = MilTakeOverer::Make();
@@ -396,7 +387,6 @@ namespace test_main {
             renderer->audioManager.engine = gminiaudio::makeAudioEngine();
             std::fprintf(stderr, "[dbg init] renderer->init()...\n");
             renderer->init();
-            std::fprintf(stderr, "[probe-eg] RET-renderer-init\n");
             std::fprintf(stderr, "[dbg init] done\n");
 
             base.audioManagerRef = &renderer->audioManager;
@@ -406,9 +396,27 @@ namespace test_main {
             base.chartDir = chartDir;
             // [Storyboard 根目录自动寻找] 传入谱面文件路径, 贴图搜索根以"谱面实际所在目录"为基准(解压根可能在上一层)
             renderer->setStoryboardAssetDir(chartDir, path);
+            // [Reveal] 解锁演出(mil-reveal-1): 资产根目录 meta.json 的 "reveal" 键(无则无演出)
+            renderer->loadRevealFromMeta(chartDir);
 
             // 统一用 UTF-8 路径读取(fopen 是 ANSI,中文路径必失败;Data::MakeFromFile 走 filesystem char8_t 可正常读)
-            auto fileData = Data::MakeFromFile(path);
+            // 长路径兜底(2026-10-19): 路径 >260 时 fs::path 必失败(如 Threat - Waterfront Complex 261 字符)
+            //   → \\?\ 前缀 + 反斜杠用 fopen 重读(纯 ASCII 长路径; 非 ASCII 超长路径仍不支持)
+            auto fileData = [&]() -> Data {
+                try { return Data::MakeFromFile(path); }
+                catch (...) {
+                    std::string bp = path;
+                    for (auto& c : bp) if (c == '/') c = '\\';
+                    std::ifstream f("\\\\?\\" + bp, std::ios::binary | std::ios::ate);
+                    if (!f) throw;
+                    uint64 size = f.tellg();
+                    f.seekg(0);
+                    Data d;
+                    d.data.resize((size_t)size);
+                    if (!f.read((char*)d.data.data(), (std::streamsize)size)) throw std::runtime_error("failed to read file (long path)");
+                    return d;
+                }
+            }();
             std::string text = fileData.toString();
 
             // [Milize JS] 检测官方 JS 谱面(MilizeBeatmap)→ 内嵌 quickjs 执行 → 直接构造 MilChart
@@ -474,7 +482,7 @@ namespace test_main {
 
         auto loadChart(const std::string& path, const std::string& chartDir) {
             base.chartDir = chartDir;
-            
+
             auto resultInfo = renderer->loadChart({
                 .data = Data::MakeFromFile(path)
             });
@@ -1286,16 +1294,25 @@ namespace test_main {
     };
     // [Intro] 起 BGM 前播载入信息页(t<0), 时长 = introLeadTotal(开场 4.2 + 收场后停留 3.0)
     // 计时用 steady_clock: 此时 BGM 尚未开始, 不能用音频时间
+    // [Reveal] reveal 段(mil-reveal-1)在最前: 播 PV 音频(与视频同帧; 无则静音), 到 RD 停; 跳过信息页直进打歌
     inline void playMilIntroLead(MilWindow& win) {
-        if (!MilTakeOverer::introEnabled) return;   // --no-intro: 不播载入页前导
+        if (!MilTakeOverer::introEnabled && !MilTakeOverer::revealEnabled) return;
         using clock = std::chrono::steady_clock;
-        const float64 intro = geasy_phi::introLeadTotal;
+        const float64 reveal = MilTakeOverer::revealEnabled ? win.renderer->revealDuration() : 0.0;
+        const float64 intro = (reveal > 0.0 || !MilTakeOverer::introEnabled) ? 0.0 : geasy_phi::introLeadTotal;
+        const float64 total = reveal + intro;
+        if (total <= 0.0) return;
+        bool pvLive = false;
         const auto t0 = clock::now();
         while (true) {
             const float64 el = std::chrono::duration<float64>(clock::now() - t0).count();
-            if (el >= intro) break;
-            if (!win.mainloopFrame({ .base = { .time = el - intro } })) break;
+            if (el >= total) break;
+            // [Reveal] reveal 段播 PV 音频(drawMilRevealPage 内 realTime 也会自起, 这里兜底保证起播)
+            if (el < reveal && !pvLive) { win.renderer->startRevealAudio(); pvLive = true; }
+            else if (pvLive && el >= reveal) { win.renderer->stopRevealAudio(); pvLive = false; }
+            if (!win.mainloopFrame({ .base = { .time = el - total } })) break;
         }
+        if (pvLive) win.renderer->stopRevealAudio();
     }
 
     MilZipResolved resolveMilZip(const std::string& zipPath) {
@@ -1311,7 +1328,6 @@ namespace test_main {
         if (!mz_zip_reader_init_file(&zip, zipPath.c_str(), 0))
             throw std::runtime_error("failed to open zip: " + zipPath);
         int n = (int)mz_zip_reader_get_num_files(&zip);
-        std::fprintf(stderr, "[dbg zip] %d entries\n", n);
         for (int i = 0; i < n; i++) {
             mz_zip_archive_file_stat st;
             if (!mz_zip_reader_file_stat(&zip, i, &st)) continue;
@@ -1324,7 +1340,6 @@ namespace test_main {
                 std::fprintf(stderr, "[dbg zip] extract fail: %s\n", st.m_filename);
         }
         mz_zip_reader_end(&zip);
-        std::fprintf(stderr, "[dbg zip] extracted to %s\n", extractDir.string().c_str());
 
         MilZipResolved r;
         r.dir = extractDir.string();
@@ -1346,15 +1361,12 @@ namespace test_main {
                 if (e.file_size() > imgSize) { imgSize = e.file_size(); r.image = e.path().string(); }
             }
         }
-        std::fprintf(stderr, "[dbg zip] chart='%s' audio='%s' image='%s'\n",
-            r.chart.c_str(), r.audio.c_str(), r.image.c_str());
         if (r.chart.empty()) throw std::runtime_error("zip 中找不到谱面文件(.js/.json)");
         if (r.audio.empty()) throw std::runtime_error("zip 中找不到音频文件(.wav/.mp3/.ogg/...)");
         // [Storyboard 根目录自动寻找] 贴图/图片根 = 谱面文件实际所在目录(解压根可能在上一层, 如 charts/<name>/)
         {
             fs::path chartParent = fs::path(r.chart).parent_path();
             if (!chartParent.empty()) r.dir = chartParent.lexically_normal().string();
-            std::fprintf(stderr, "[dbg zip] assetDir(自动定位) = %s\n", r.dir.c_str());
         }
         return r;
     }
@@ -1410,6 +1422,7 @@ namespace test_main {
             backendWin.base.window->setHidden(true);
             backendWin.base.window->setSwapInterval(0);
             backendWin.base.surfaceSize = { (uint64)W, (uint64)H };
+            MilTakeOverer::revealRealTime = false;   // [Reveal] 录制循环无实时时钟 → 同步解码
             backendWin.loadChart(chartPath, chartDir);
             if (!imagePath.empty()) {
                 try { backendWin.renderer->loadIllustion(imagePath); }
@@ -1447,14 +1460,38 @@ namespace test_main {
                 .sfxRandshake = settings.recordSfxRandshake
             });
             // [Intro] 视频从 -introLead 起渲染(载入信息页), 音频前插等长静音以保持音画同步
-            const float64 introLead = MilTakeOverer::introEnabled ? geasy_phi::introLeadTotal : 0.0;   // --no-intro 时为 0: 无开场帧/无静音前插
-            {
+            // [Reveal] reveal 段(mil-reveal-1): 音频 = PV 音频(与视频同帧; 无则静音) + BGM 全长
+            const float64 revealLead = MilTakeOverer::revealEnabled ? backendWin.renderer->revealDuration() : 0.0;
+            float64 introLead = 0.0;
+            if (revealLead > 0.0) {
+                auto lead = mixedAudio->copy();
+                lead->channels = mixedAudio->channels;
+                lead->sampleRate = mixedAudio->sampleRate;
+                lead->data.assign((size_t)((float64)lead->sampleRate * revealLead) * lead->channels, 0);
+                if (backendWin.renderer->revealAudio) {
+                    auto pv = backendWin.renderer->revealAudio->copy();
+                    pv->resample(lead->channels, lead->sampleRate);
+                    size_t n = std::min(pv->data.size(), lead->data.size());
+                    std::copy(pv->data.begin(), pv->data.begin() + n, lead->data.begin());
+                }
+                // [本家] StartGame SE 在视频/PV 音频完后(revealBaseDur)响, 响完切打歌(RD)
+                if (backendWin.renderer->revealSeAudio) {
+                    auto se = backendWin.renderer->revealSeAudio->copy();
+                    se->resample(lead->channels, lead->sampleRate);
+                    lead->overlapSecond(se, backendWin.renderer->revealBaseDur, 1.0);
+                }
+                lead->data.insert(lead->data.end(), mixedAudio->data.begin(), mixedAudio->data.end());
+                cap.writeAudio(lead);
+                introLead = revealLead;
+            } else {
+                const float64 introOnly = MilTakeOverer::introEnabled ? geasy_phi::introLeadTotal : 0.0;
                 auto lead = mixedAudio->copy();   // 复用类型, 避免 gdecoded_audio 别名在此作用域已 undef
                 lead->channels = mixedAudio->channels;
                 lead->sampleRate = mixedAudio->sampleRate;
-                lead->data.assign((size_t)((float64)lead->sampleRate * introLead) * lead->channels, 0);
+                lead->data.assign((size_t)((float64)lead->sampleRate * introOnly) * lead->channels, 0);
                 lead->data.insert(lead->data.end(), mixedAudio->data.begin(), mixedAudio->data.end());
                 cap.writeAudio(lead);
+                introLead = introOnly;
             }
             // ⚠ calcConfig.songLength 首次 render() 才赋值, 这里必须用 audioManager 的长度
             const float64 recSongLength = backendWin.renderer->audioManager.getBgmLength();
@@ -1527,13 +1564,14 @@ namespace test_main {
             if (slash != std::string::npos) chartDir = chartPath.substr(0, slash);
 
             std::string imagePath;
+            std::string audioPath;   // [Reveal] zip 音频(载入后 RD=BGM 长, t<0 才能渲 reveal 段)
             std::string effChart = chartPath;
             {
                 std::string lower = effChart;
                 for (auto& c : lower) c = (char)std::tolower((unsigned char)c);
                 if (lower.size() >= 4 && lower.rfind(".zip") == lower.size() - 4) {
                     auto r = resolveMilZip(effChart);
-                    effChart = r.chart; chartDir = r.dir; imagePath = r.image;
+                    effChart = r.chart; chartDir = r.dir; imagePath = r.image; audioPath = r.audio;
                 }
             }
 
@@ -1546,8 +1584,12 @@ namespace test_main {
             std::fprintf(stderr, "[dbg screenshot] window hidden, swapInterval=0\n");
 
             backendWin.base.surfaceSize = { (uint64)W, (uint64)H };
+            MilTakeOverer::revealRealTime = false;   // [Reveal] 截图跳任意 t → 同步解码
 
             auto info = backendWin.loadChart(effChart, chartDir);
+            if (!audioPath.empty()) {
+                try { backendWin.renderer->audioManager.load(audioPath); } catch (...) {}   // [Reveal] 需 BGM 长度定 RD
+            }
             if (imagePath.empty()) {
                 auto metaData = Data::MakeFromFileOptional(chartDir.empty() ? "meta.json" : chartDir + "/meta.json");
                 if (metaData) {
@@ -1697,6 +1739,21 @@ namespace test_main {
             auto path = Win32Utils::wstringToString(pathW);
             if (path.empty()) return;
             WidgetStatics::TextInput::setText(win->refWidget(chartFileInput), Win32Utils::stringToWstring(path));
+        } }));
+        win->registerWidget(Widgets::Button({ .text = L"载入Zip", .onClick = [&]() {
+            auto pathW = selectOpenFile(win.get(), L"Chart Zip (*.zip)\0*.zip\0All Files (*.*)\0*.*\0", L"打开谱面 Zip");
+            auto path = Win32Utils::wstringToString(pathW);
+            if (path.empty()) return;
+            try {
+                auto r = resolveMilZip(path);
+                if (r.image.empty()) { WidgetStatics::TextInput::setText(win->refWidget(bgFileInput), L""); imagePath = ""; }
+                else WidgetStatics::TextInput::setText(win->refWidget(bgFileInput), Win32Utils::stringToWstring(r.image));
+                WidgetStatics::TextInput::setText(win->refWidget(audioFileInput), Win32Utils::stringToWstring(r.audio));
+                WidgetStatics::TextInput::setText(win->refWidget(chartRootInput), Win32Utils::stringToWstring(r.dir));
+                WidgetStatics::TextInput::setText(win->refWidget(chartFileInput), Win32Utils::stringToWstring(r.chart));
+            } catch (const std::exception& e) {
+                showErrorMsg(win.get(), Win32Utils::stringToWstring(e.what()).c_str());
+            }
         } }));
         win->nextRow();
 
@@ -1969,21 +2026,37 @@ namespace test_main {
             pd.setLine(1, L"写入音频...");
             // (原 cap.writeAudio(mixedAudio) 由下方带静音前导的版本替代)
             // [Intro] 视频从 -introLead 起渲染(载入信息页), 音频前插等长静音以保持音画同步
-            const float64 introLead = MilTakeOverer::introEnabled ? geasy_phi::introLeadTotal : 0.0;   // --no-intro 时为 0: 无开场帧/无静音前插
+            // [Reveal] reveal 段(mil-reveal-1)在最前: PV 音频(与视频同帧; 无则静音), 之后信息页静音段
+            const float64 revealLead = MilTakeOverer::revealEnabled ? backendWin.renderer->revealDuration() : 0.0;
+            // [Reveal] reveal 启用 = 跳过信息页(render 只认 t<0→reveal 页), 前导只留 reveal 段
+            const float64 introLead = (revealLead > 0.0 || !MilTakeOverer::introEnabled ? 0.0 : geasy_phi::introLeadTotal) + revealLead;
             {
                 auto lead = mixedAudio->copy();
                 lead->channels = mixedAudio->channels;
                 lead->sampleRate = mixedAudio->sampleRate;
                 lead->data.assign((size_t)((float64)lead->sampleRate * introLead) * lead->channels, 0);
+                if (revealLead > 0.0 && backendWin.renderer->revealAudio) {
+                    auto pv = backendWin.renderer->revealAudio->copy();
+                    pv->resample(lead->channels, lead->sampleRate);
+                    size_t n = std::min(pv->data.size(), lead->data.size());
+                    std::copy(pv->data.begin(), pv->data.begin() + n, lead->data.begin());
+                }
+                // [本家] StartGame SE 在视频/PV 音频完后(revealBaseDur)响, 响完切打歌(RD)
+                if (revealLead > 0.0 && backendWin.renderer->revealSeAudio) {
+                    auto se = backendWin.renderer->revealSeAudio->copy();
+                    se->resample(lead->channels, lead->sampleRate);
+                    lead->overlapSecond(se, backendWin.renderer->revealBaseDur, 1.0);
+                }
                 lead->data.insert(lead->data.end(), mixedAudio->data.begin(), mixedAudio->data.end());
                 cap.writeAudio(lead);
             }
 
             pd.setLine(1, L"渲染视频...");
+            MilTakeOverer::revealRealTime = false;   // [Reveal] 录制循环无实时时钟 → 同步解码
             uint64 frameCut = 0;
             std::thread frameWriterThread(frameWriter);
             FramerateMeter fpsMeter {};
-            
+
             while (true) {
                 float64 t = frameCut / settings.recordFPS - introLead;   // t < 0 = 载入信息页
                 if (t > backendWin.renderer->audioManager.getBgmLength()) break;
@@ -2014,6 +2087,7 @@ namespace test_main {
             frameQueue.enqueue(std::nullopt);
             frameWriterThread.join();
 
+            MilTakeOverer::revealRealTime = true;   // [Reveal] 还原实时模式(GUI 预览用)
             pd.setLine(1, L"释放资源...");
             std::wstring msg = L"渲染完成, 已保存到 " + Win32Utils::stringToWstring(videoPath);
             showInfoMsg(win.get(), msg.c_str());
@@ -2058,7 +2132,10 @@ void entrypoint() {
         for (int ai = 0; ai < argc; ai++) argv[ai] = const_cast<char*>(argvUtf8[(size_t)ai].c_str());
     }
 #endif
-    for (int i = 1; i < argc; i++) if (std::string(argv[i]) == "--no-intro") geasy_phi::MilTakeOverer::introEnabled = false;
+    for (int i = 1; i < argc; i++) {
+        if (std::string(argv[i]) == "--no-intro") geasy_phi::MilTakeOverer::introEnabled = false;
+        if (std::string(argv[i]) == "--no-reveal") geasy_phi::MilTakeOverer::revealEnabled = false;   // [Reveal] 跳过解锁演出段
+    }
     if (argc >= 6 && std::string(argv[1]) == "--screenshot") {
         double t = argc >= 7 ? std::atof(argv[6]) : 1.983;
         test_main::runMilScreenshot(argv[2], std::atoi(argv[3]), std::atoi(argv[4]), argv[5], t);
