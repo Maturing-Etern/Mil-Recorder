@@ -1414,6 +1414,35 @@ namespace test_main {
             }
             if (audioPath.empty()) throw std::runtime_error("缺少音频(裸谱面请传第 7 参音频路径; zip 会自动查找)");
 
+            if (imagePath.empty()) {
+                auto metaData = Data::MakeFromFileOptional(chartDir.empty() ? "meta.json" : chartDir + "/meta.json");
+                if (metaData) {
+                    try {
+                        auto metaRoot = JsonNode::Parse(*metaData);
+                        if (metaRoot.isObject() && metaRoot.hasKey("image_file") && metaRoot["image_file"].isString()) {
+                            imagePath = metaRoot["image_file"].getString();
+                            if (!chartDir.empty() && imagePath.find('/') == std::string::npos && imagePath.find('\\') == std::string::npos)
+                                imagePath = chartDir + "/" + imagePath;
+                        }
+                    } catch (...) {}
+                }
+            }
+            if (imagePath.empty() && lower.size() >= 5 && lower.rfind(".json") == lower.size() - 5) {
+                auto chartData = Data::MakeFromFileOptional(chartPath);
+                if (chartData) {
+                    try {
+                        auto root = JsonNode::Parse(*chartData);
+                        if (root.isObject() && root.hasKey("meta") && root["meta"].isObject()) {
+                            auto& m = root["meta"];
+                            if (m.hasKey("artworkPath") && m["artworkPath"].isString()) {
+                                std::string ap = m["artworkPath"].getString();
+                                if (!ap.empty()) imagePath = chartDir.empty() ? ap : chartDir + "/" + ap;
+                            }
+                        }
+                    } catch (...) {}
+                }
+            }
+
             Settings settings {};
             settings.fromRegistry();
 

@@ -4071,6 +4071,7 @@ void main() {
         std::string charter;
         std::string difficultyName;
         float64 difficultyValue;
+        std::string difficultyDisplay;
 
         enum class NoteFlowSpeedBehavior {
             Override, Multiply, Add
@@ -4089,6 +4090,9 @@ void main() {
         bool rpuOrientation = false;
 
         std::string getFinalDifficultyString() {
+#ifndef MIL_DIFF_NUMERIC_ONLY
+            if (!difficultyDisplay.empty()) return difficultyName + " " + difficultyDisplay;
+#endif
             auto ret = difficultyName + " ";
             ret += std::to_string((int64)difficultyValue);
             if (std::fmod(difficultyValue, 1.0) != 0.0) ret += "+";
@@ -4221,6 +4225,7 @@ void main() {
 
         void init() {
             std::ranges::fill(lastUpdatedTimes, -std::numeric_limits<float64>::infinity());
+            std::ranges::fill(currentIndexs, (uint64)0);
 
             for (uint64 i = 0; i < (uint64)EnumMilEventType::MAX; i++) {
                 auto& typedEvents = events[i];
@@ -4623,6 +4628,7 @@ void main() {
                 return a.timeZone.x < b.timeZone.x;
             });
 
+            noteGroups.clear();
             noteGroups.emplace_back().breakable = false;
             std::unordered_map<uint64, uint64> noteGroupMap;
 
@@ -4861,6 +4867,8 @@ void main() {
         std::vector<MilStoryboardObject> storyboardObjects;
         MilAnimator animator;
         MilStoryboardAssets storyboardAssets;
+
+        bool remGodotFrame = false;
         
         std::vector<MilHitEffectItem> hitEffects;
         std::vector<MilFractureFx> fractureFxs;
@@ -4928,12 +4936,7 @@ void main() {
             
             Transform2D lineTransform {};
             lineTransform.translate(linePosition);
-            // [旋转方向对齐 RPU] RainPlayerUnity MilDataStructs.GetCanvasTransform:
-            //   world = lineCenter + lineSize * R(90-rot) * (px, py)（canvas y-up）
-            //   ⇒ 屏幕偏移 x ∝ -sin(90-rot)*fp, y ∝ -cos(90-rot)*fp（y-down）
-            // 旧实现 scale(1,-1) 在 rotate 之前，等于让旋转作用在 y-down 帧，旋转线整体左右镜像。
-            // 90-rot → rot-90 等价于把旋转角取反（x 分量镜像），rot=90 时恒等、竖直线不受影响。
-            lineTransform.rotateDegrees(lineRotation - 90);
+            lineTransform.rotateDegrees(90.0 - lineRotation);
             lineTransform.scale(screenSize / meta.worldViewport.abs());
             lineTransform.scale(lineSize);
             lineTransform.scale(1.0, -1.0);
@@ -5121,7 +5124,6 @@ void main() {
                 auto& line = lines[i];
                 for (uint64 j = 0; j < line.notes.size(); j++) {
                     auto& note = line.notes[j];
-                    if (note.isFake) continue;
                     if (!note.isFracture()) continue;
 
                     auto& fx = fractureFxs.emplace_back();
@@ -5361,6 +5363,12 @@ void main() {
         if (metaNode.hasKey("charter") && metaNode["charter"].isString()) chart.meta.charter = metaNode["charter"].getString();
         if (metaNode.hasKey("difficulty_name") && metaNode["difficulty_name"].isString()) chart.meta.difficultyName = metaNode["difficulty_name"].getString();
         if (metaNode.hasKey("difficulty") && metaNode["difficulty"].isNumber()) chart.meta.difficultyValue = metaNode["difficulty"].getNumber();
+        else if (metaNode.hasKey("difficulty") && metaNode["difficulty"].isString()) {
+            auto s = metaNode["difficulty"].getString();
+            chart.meta.difficultyValue = std::atof(s.c_str()) + (s.find('+') != std::string::npos ? 0.5 : 0.0);
+        }
+        if (metaNode.hasKey("difficulty_display") && metaNode["difficulty_display"].isString()) chart.meta.difficultyDisplay = metaNode["difficulty_display"].getString();
+        else if (chart.meta.difficultyDisplay.empty() && metaNode.hasKey("difficulty") && metaNode["difficulty"].isString()) chart.meta.difficultyDisplay = metaNode["difficulty"].getString();
         std::vector<MilBPMEvent> bpms;
         if (jsonRoot.hasKey("bpms") && jsonRoot["bpms"].isArray()) {
             for (auto& bpmNode : jsonRoot["bpms"].getArray()) {
@@ -5511,6 +5519,7 @@ void main() {
             std::string musicTitle, musicAuthor, artworkAuthor, chartAuthor;
             std::string difficultyCode, musicFilePath, artworkPath;
             float64 difficultyLevel = 0.0;
+            std::string difficultyLevelRaw;
             float64 offset = 0.0;      // 单位: 毫秒(chart.json meta.offset, 如 -430)
         };
         float64 bpm = 120.0;
@@ -5602,8 +5611,11 @@ void main() {
             takeStr("artworkPath", rem.meta.artworkPath);
             if (m.hasKey("difficultyLevel")) {
                 if (m["difficultyLevel"].isNumber()) rem.meta.difficultyLevel = m["difficultyLevel"].getNumber();
-                else if (m["difficultyLevel"].isString())
-                    rem.meta.difficultyLevel = std::atof(m["difficultyLevel"].getString().c_str());
+                else if (m["difficultyLevel"].isString()) {
+                    auto s = m["difficultyLevel"].getString();
+                    rem.meta.difficultyLevelRaw = s;
+                    rem.meta.difficultyLevel = std::atof(s.c_str()) + (s.find('+') != std::string::npos ? 0.5 : 0.0);
+                }
             }
             rem.meta.offset = num(m, "offset", 0.0);
         }
@@ -5724,10 +5736,12 @@ void main() {
     // ---------- 3) 胶水层：RemJson + RemUnits → MilChart ----------
     MilChart buildMilChartFromRemJson(const RemJson& rem, const RemUnits& u = RemUnits {}) {
         MilChart chart {};
+        chart.remGodotFrame = true;
         chart.meta.noteFlowSpeedBehavior = MilMeta::NoteFlowSpeedBehavior::Override;
         // [REM 对齐] 线默认流速 = 1(REM 播放器: 滚动 = speedEvent × base_speed, 无线级 flow 概念;
         // 默认 9 会让无 speed 字段的音符 9 倍速飞出屏幕)
         chart.animator.lineDefaultFlowSpeed = 1.0;
+        chart.animator.rpuSpeedTrapezoid = true;
         chart.meta.worldOrigin = { (float64)-1920 / 2, (float64)1080 / 2 };
         chart.meta.worldViewport = { 1920, -1080 };
         chart.meta.speedUnit = u.speedUnit();
@@ -5737,6 +5751,7 @@ void main() {
         chart.meta.charter = rem.meta.chartAuthor;
         chart.meta.difficultyName = rem.meta.difficultyCode;
         chart.meta.difficultyValue = rem.meta.difficultyLevel;
+        if (!rem.meta.difficultyLevelRaw.empty()) chart.meta.difficultyDisplay = rem.meta.difficultyLevelRaw;
         // ---- offset (时间轴平移) ----
         // REM(Godot 播放器权威用法, chart_player.gd L695): current_time_ms = audio_pos_ms + offset
         //   ⇒ REM 谱面时间轴 C = 音频时间轴 A + offset_rem(ms)
@@ -6016,7 +6031,7 @@ void main() {
                     e.type = kd.type;
                     e.timeZone = { a, b };
                     e.valueZone = { ra.sv * kd.scale + kd.bias, ra.tv * kd.scale + kd.bias };
-                    attachEasing(e, ra.easing);
+                    if (kd.type != EnumMilEventType::Speed) attachEasing(e, ra.easing);
                     chart.animator.addEvent({ EnumMilObjectType::Line, thisLine }, e);
                     nEvents++;
                 }
