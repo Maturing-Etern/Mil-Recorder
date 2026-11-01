@@ -32,3 +32,9 @@ promo_video/
 # Archives
 *.rar
 _line_extract.png
+
+# mdBook build output
+docs/book/
+
+# internal security SOP (not public)
+docs/securitycheck-sop.md

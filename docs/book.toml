@@ -1,0 +1,11 @@
+[book]
+title = "Mil Recorder 文档"
+authors = ["Maturing-Etern"]
+language = "zh-CN"
+multilingual = false
+src = "src"
+
+[output.html]
+default-theme = "navy"
+git-repository-url = "https://github.com/Maturing-Etern/Mil-Recorder"
+edit-url-template = "https://github.com/Maturing-Etern/Mil-Recorder/edit/main/docs/{path}"

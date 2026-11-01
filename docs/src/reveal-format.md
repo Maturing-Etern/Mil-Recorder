@@ -1,0 +1,79 @@
+# mil-reveal-1 — 自制谱解锁演出格式
+
+让自制谱包声明"进谱前的解锁演出"（1:1 对齐本家 PV 视频解锁：黑底全屏视频 + 倒计时，
+视频放完音乐继续放，音乐结束才进谱面）。
+别人拿到包后无需任何配置，Mil-Recorder 会自动检测并播放。
+
+## 位置
+
+配置直接写在谱面包已有的 **meta.json** 里，加一个 `"reveal"` 键值对即可（无独立文件）：
+- **zip 包**：meta.json 与谱面/音频同目录（或解压后谱面所在目录）
+- **裸谱面文件**：meta.json 放谱面同目录
+
+没有 `"reveal"` 键 = 无解锁演出，行为与旧版完全一致。
+
+## 格式
+
+```json
+{
+  "image_file": "cover.png",
+  "name": "曲名",
+  "composer": "曲师",
+  "reveal": {
+    "fmt": "mil-reveal-1",
+    "video": "reveal.mp4"
+  }
+}
+```
+
+### 字段说明
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| fmt | string | ✅ | 恒为 `"mil-reveal-1"`（校验用） |
+| video | string | ✅ | 解锁演出视频，包内相对路径。推荐 **H.264 + yuv420p** mp4（软解支持 h264/hevc/av1/vp9，非 420 平面格式会黑屏退回） |
+| ui.countdown | bool | ❌ | 右下角剩余时间，默认 `true`（本家 CountDown：anchor(1,0) pos(-122,101)，显示音乐剩余 `Length-Time`） |
+| timing.musicAwaitTime | number | ❌ | 本家"音乐 !IsPlaying 累计 3s 兜底进谱"，默认 `3.0`（本家恒 3.0；CLI 导出时间轴不使用） |
+
+视频音频轨会被忽略——**演出背景音乐 = 谱面 BGM**（本家：PV 页用 JuceAudioSourcePlayer 单独放整曲，
+与视频 isPrepared 同帧起播）。
+
+## 本家行为（libil2cpp 反汇编 2026-10-22 实锤）
+
+`Milthm.PV.PVController`（Update 0x42cf074 / loopPointReached 0x42ceebc / StartGame 0x42cef58）：
+
+1. 视频 `isPrepared` → `ready=true` → `Music.Play()` **同帧起播**
+2. 每帧 `CountDown.text = Music.Length - Music.Time`
+3. 视频播完（loopPointReached）→ 只置 `videoDone=true`，**音乐继续放**
+4. 音乐 `!IsPlaying` 且未 loaded → `StartGame()`（`Cutscene.Run(BlackLoading)` → `LaunchGameplay` + `SndPlayer.Play(-1,3)` 启动音）
+5. 兜底：音乐从未播出（`!IsPlaying` 累计）≥3.0s → `musicAwaitTime=0` + 置位后同帧进谱
+
+即：**视频放完 ≠ 进谱面，音乐整首放完才进**。
+
+## 时间轴
+
+RD = BGM 全长。完整负时间轴（reveal 启用时**跳过开场信息页**，视频完直接进打歌）：
+
+```
+[-RD … 0)   解锁演出(reveal): 黑底 + 全屏视频 + CountDown, BGM 从 0 播放
+[0 …)       打歌(BGM 从头重播, 进度条从 0 滚动)
+```
+
+无 reveal 时维持旧时间轴：`[-introLeadTotal … 0)` 开场信息页 → `[0 …)` 打歌。
+
+## 播放器侧实现状态（Mil-Recorder）
+
+| 能力 | 状态 |
+|---|---|
+| FFmpeg 视频软解（后台线程 + 有界帧队列 + 音频钟取帧） | ✅ 已实现 |
+| BGM 同播 + 音乐完进谱 + CountDown | ✅ 已实现 |
+| 跳过开场信息页直进打歌 | ✅ 已实现 |
+| LOGO / TapToStart / 雨粒子 | ⏳ 官方贴图在私有容器内，待还原 |
+| Godot REM 播放器 | ⏳ 格式共用，待移植 |
+
+## CLI 验证
+
+```
+mil-recorder.exe --record <chart_or_zip> <out.mp4> [W H]   # 导出含 reveal 段(h264+aac)
+mil-recorder.exe --no-reveal ...                            # 跳过解锁演出
+```
