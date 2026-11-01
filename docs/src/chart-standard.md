@@ -51,10 +51,10 @@ MyChart.zip
 
 ## 支持的谱面格式
 
-| 格式 | 识别 | 备注 |
+| 格式 | 识别 | 字段级分析 |
 |------|------|------|
-| devjson（format 2） | `.json` | Milthm 格式化谱面 |
-| REM | `.json` | Rain Editor Mobile JSON；v1.5 新字段（`bpmChanges` 三元组节拍、`parentId` 父子轨道）已支持 |
-| 官方 JS 谱面 | `.js` | MilizeBeatmap，经内置 quickjs 执行 |
+| devjson（format 2） | `.json` | [devjson 字段分析](format-devjson.md) |
+| REM | `.json` | [REM 字段分析](format-rem.md) |
+| 官方 JS 谱面 | `.js` | [官方 JS 字段分析](format-ingame-js.md) |
 
 三种格式共享同一条渲染链路；事件与判定线行为均以 Milthm 游戏本体为对齐基准。

@@ -6,6 +6,7 @@
 |------|------|
 | [使用方式](usage.md) | 获取方式、GUI 界面说明、命令行参数全表 |
 | [谱面包规范](chart-standard.md) | zip 谱面包结构、meta.json 字段、谱面文件 meta 与难度显示 |
+| [谱面格式分析](format-devjson.md) | devjson / REM / 官方 JS 三种谱面的逐字段分析（坐标系、事件表、时间换算） |
 | [解锁演出格式](reveal-format.md) | `meta.json` 的 `reveal` 段：自制谱进谱前 PV 演出（mil-reveal-1） |
 | [参数导出格式](dumpmil.md) | `--dumpmil` 输出行逐字段说明与对拍口径 |
 | [构建指南](build.md) | 前置依赖、一键编译、grain 全链构建、安装包与发版 |
