@@ -6,6 +6,8 @@ multilingual = false
 src = "src"
 
 [output.html]
-default-theme = "navy"
+default-theme = "dark"
+preferred-dark-theme = "dark"
+additional-css = ["src/custom.css"]
 git-repository-url = "https://github.com/Maturing-Etern/Mil-Recorder"
 edit-url-template = "https://github.com/Maturing-Etern/Mil-Recorder/edit/main/docs/{path}"
