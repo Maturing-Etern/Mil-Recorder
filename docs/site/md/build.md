@@ -66,15 +66,24 @@ ISCC.exe mil_recorder.iss
 
 ## 文档站部署（Cloudflare Pages）
 
-文档由 mdBook 构建到 `docs/book/`，部署在 Cloudflare Pages。仓库设置一次性配置：
+文档为 HTML 壳 + Markdown 内容源（`docs/site/md/`），页面运行时拉取渲染，部署在 Cloudflare Pages，无构建依赖：
 
 | 项 | 值 |
 |------|------|
 | Production branch | `main` |
-| Build command | `curl -sL https://github.com/rust-lang/mdBook/releases/download/v0.4.52/mdbook-v0.4.52-x86_64-unknown-linux-gnu.tar.gz \| tar xz -C /tmp && /tmp/mdbook build docs` |
-| Build output directory | `docs/book` |
+| Build command | 留空 |
+| Build output directory | `docs/site` |
 
-推送到 `main` 的 `docs/**` 变更会自动触发重新部署；本地预览用 `mdbook serve docs`。
+推送到 `main` 的 `docs/**` 变更会自动触发重新部署。
+
+本地预览需经 HTTP 服务（`fetch` 在 `file://` 下被浏览器拦截）：
+
+```bash
+cd docs/site && python -m http.server 8080
+# 打开 http://localhost:8080
+```
+
+改内容直接编辑 `docs/site/md/*.md`，刷新页面即生效，无构建步骤。
 
 ## 项目结构
 

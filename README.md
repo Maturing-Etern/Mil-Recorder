@@ -2,8 +2,8 @@
 
 基于 [easy-phi](https://github.com/qaqFei/easy-phi) 的 Milthm 谱面渲染与视频录制工具：实时预览、离屏逐帧录制、解锁演出还原与谱面参数导出。
 
-- 📖 **完整文档**：[docs/](docs/src/README.md)（使用方式 / 谱面包规范 / 参数导出 / 构建指南）
-- 🔑 **获取**：申请审核通过后发放，或按[构建指南](docs/src/build.md)自行编译
+- 📖 **完整文档**：[docs/](docs/site/)（使用方式 / 谱面包规范 / 参数导出 / 构建指南）
+- 🔑 **获取**：申请审核通过后发放，或按[构建指南](docs/site/#/build)自行编译
 
 ## 功能
 
@@ -27,18 +27,18 @@ mil-recorder.exe --record "谱面包.zip" 1920 1080 60 out.mp4
 mil-recorder.exe --screenshot "chart.json" 1920 1080 frame.bmp 12.5
 ```
 
-更多用法见[使用方式](docs/src/usage.md)。
+更多用法见[使用方式](docs/site/#/usage)。
 
 ## 文档
 
 | 分册 | 内容 |
 |------|------|
-| [简介与导航](docs/src/README.md) | 文档总览 |
-| [使用方式](docs/src/usage.md) | 获取方式、GUI 界面、命令行参数全表、FAQ |
-| [谱面包规范](docs/src/chart-standard.md) | zip 三件套识别规则、meta.json、谱面 meta 与难度显示 |
-| [解锁演出格式](docs/src/reveal-format.md) | `reveal` 段格式（mil-reveal-1） |
-| [参数导出格式](docs/src/dumpmil.md) | `--dumpmil` 输出行逐字段说明与对拍口径 |
-| [构建指南](docs/src/build.md) | 前置依赖、一键编译、grain 全链、安装包与发版 |
+| [简介与导航](docs/site/) | 文档总览 |
+| [使用方式](docs/site/#/usage) | 获取方式、GUI 界面、命令行参数全表、FAQ |
+| [谱面包规范](docs/site/#/chart-standard) | zip 三件套识别规则、meta.json、谱面 meta 与难度显示 |
+| [解锁演出格式](docs/site/#/reveal-format) | `reveal` 段格式（mil-reveal-1） |
+| [参数导出格式](docs/site/#/dumpmil) | `--dumpmil` 输出行逐字段说明与对拍口径 |
+| [构建指南](docs/site/#/build) | 前置依赖、一键编译、grain 全链、安装包与发版 |
 
 ## 许可
 

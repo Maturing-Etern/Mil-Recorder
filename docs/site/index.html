@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Mil Recorder 文档</title>
+<meta name="description" content="Milthm 谱面渲染器文档:使用方式、谱面包规范、谱面格式分析(fmt2/devjson/REM)、参数导出与构建指南。">
+<link rel="preconnect" href="https://fonts.loli.net">
+<link rel="preconnect" href="https://gstatic.loli.net" crossorigin>
+<link href="https://fonts.loli.net/css2?family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<script src="./marked.min.js"></script>
+<style>
+/* Milthm 游戏 UI 字体(ChillRoundF,与游戏本体一致) */
+@font-face{
+  font-family:'Milthm';
+  src:url('./fonts/milthm.ttf') format('truetype');
+  font-display:swap;
+}
+:root{
+  --bg:#050508;
+  --surface:#0d0d15;
+  --text:#f2f0f7;
+  --muted:#9a95ab;
+  --accent:#A87CFF;
+  --accent-deep:#7B3FEB;
+  --border:rgba(242,240,247,.10);
+  --font-display:'Milthm','Unbounded',system-ui,sans-serif;
+  --font-body:'Milthm','Noto Sans SC',system-ui,sans-serif;
+  --font-mono:'JetBrains Mono',ui-monospace,monospace;
+  --ease:cubic-bezier(.16,1,.3,1);
+  --dur:320ms;
+  --nav-w:248px;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html{scroll-behavior:smooth}
+html,body{overflow-x:clip}
+body{
+  background:var(--bg);
+  color:var(--text);
+  font-family:var(--font-body);
+  font-weight:300;
+  line-height:1.8;
+  letter-spacing:.02em;
+}
+::selection{background:var(--accent);color:#050508}
+
+/* ---------- 雨丝层 ---------- */
+.rain,.rain2{
+  position:fixed;inset:-20% 0;z-index:0;pointer-events:none;
+  background-image:repeating-linear-gradient(
+    84deg,
+    transparent 0 26px,
+    rgba(255,255,255,.07) 26px 27px,
+    transparent 27px 118px);
+}
+.rain2{
+  background-image:repeating-linear-gradient(
+    84deg,
+    transparent 0 61px,
+    rgba(168,124,255,.09) 61px 62px,
+    transparent 62px 210px);
+  animation:rainfall 2.6s linear infinite;
+}
+.rain{animation:rainfall 4.4s linear infinite}
+@keyframes rainfall{
+  from{transform:translate3d(40px,-8%,0)}
+  to{transform:translate3d(-40px,8%,0)}
+}
+
+/* ---------- 侧栏 ---------- */
+aside{
+  position:fixed;top:0;left:0;bottom:0;width:var(--nav-w);z-index:10;
+  background:rgba(13,13,21,.86);
+  border-right:1px solid var(--border);
+  backdrop-filter:blur(8px);
+  display:flex;flex-direction:column;
+  padding:26px 0;
+  overflow-y:auto;
+}
+aside .brand{
+  padding:0 26px 20px;
+  border-bottom:1px solid var(--border);
+  margin-bottom:14px;
+}
+aside .brand b{
+  font-family:var(--font-display);font-weight:700;font-size:15px;
+  letter-spacing:.02em;display:block;
+}
+aside .brand span{
+  font-family:var(--font-mono);font-size:10.5px;letter-spacing:.26em;
+  color:var(--accent);
+}
+aside nav{flex:1}
+aside nav a{
+  display:block;
+  padding:8px 26px;
+  color:var(--muted);text-decoration:none;
+  font-size:13.5px;
+  border-left:2px solid transparent;
+  transition:color var(--dur) var(--ease),border-color var(--dur) var(--ease);
+}
+aside nav a.sub{padding-left:42px;font-size:12.5px}
+aside nav a:hover{color:var(--text)}
+aside nav a.in{color:var(--accent);border-left-color:var(--accent);font-weight:400}
+aside .f-github{
+  padding:16px 26px 0;
+  font-family:var(--font-mono);font-size:11.5px;line-height:1.9;
+  color:var(--muted);text-decoration:none;
+  border-top:1px solid var(--border);
+}
+aside .f-github:hover{color:var(--accent)}
+
+/* ---------- 主列 ---------- */
+main{
+  position:relative;z-index:1;
+  margin-left:var(--nav-w);
+  padding:clamp(48px,6vw,88px) clamp(24px,4.5vw,72px) 96px;
+  max-width:1180px;
+}
+.content{max-width:960px}
+.content h1{
+  font-family:var(--font-display);font-weight:700;
+  font-size:clamp(28px,4vw,50px);
+  letter-spacing:-.02em;line-height:1.15;
+  margin-bottom:22px;scroll-margin-top:20px;
+}
+.content h2{
+  font-family:var(--font-display);font-weight:500;
+  font-size:clamp(20px,2.6vw,30px);
+  letter-spacing:-.01em;line-height:1.25;
+  margin:44px 0 16px;padding-bottom:.35em;
+  border-bottom:1px solid rgba(168,124,255,.25);
+  scroll-margin-top:20px;
+}
+.content h3{
+  font-weight:500;font-size:17px;margin:32px 0 12px;
+  padding-left:12px;border-left:3px solid var(--accent);
+  scroll-margin-top:20px;
+}
+.content h4{font-weight:500;font-size:15px;margin:24px 0 10px}
+.content p{margin-bottom:14px;max-width:46em}
+.content ul,.content ol{padding-left:1.4em;margin-bottom:14px}
+.content li{margin-bottom:4px}
+.content a{color:var(--accent);text-decoration-color:rgba(168,124,255,.4)}
+.content a:hover{color:#c9adff}
+.content strong{color:var(--text);font-weight:500}
+.content hr{border:none;border-top:1px solid var(--border);margin:30px 0}
+
+/* ---------- 表格 ---------- */
+.content table{
+  border-collapse:collapse;
+  width:100%;margin:16px 0 22px;font-size:13.5px;
+}
+.content th,.content td{
+  border:1px solid var(--border);
+  padding:.5em .9em;text-align:left;vertical-align:top;
+}
+.content th{background:rgba(168,124,255,.10);font-weight:500}
+.content tr:nth-child(2n) td{background:rgba(255,255,255,.02)}
+.content td code,.content th code{white-space:nowrap}
+
+/* ---------- 代码 ---------- */
+.content code{
+  font-family:var(--font-mono);font-size:.86em;
+  color:var(--accent);background:rgba(168,124,255,.1);
+  padding:2px 7px;border-radius:3px;
+}
+.content pre{
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-radius:6px;
+  padding:18px 20px;
+  overflow-x:auto;
+  margin:16px 0 22px;
+  font-size:13px;line-height:1.9;
+}
+.content pre code{
+  background:transparent;color:#e6e1f5;padding:0;font-size:1em;white-space:pre;
+}
+.content blockquote{
+  border-left:3px solid var(--accent);
+  background:rgba(168,124,255,.06);
+  color:var(--muted);
+  padding:12px 18px;border-radius:0 4px 4px 0;
+  margin:16px 0 22px;font-size:13.5px;
+}
+.content blockquote p{margin-bottom:6px}
+
+/* ---------- 加载态 ---------- */
+.loader{
+  position:fixed;inset:0;z-index:50;display:none;
+  align-items:center;justify-content:center;
+  background:rgba(5,5,8,.72);backdrop-filter:blur(3px);
+}
+.loader.on{display:flex}
+.loader span{
+  font-family:var(--font-mono);font-size:12px;letter-spacing:.3em;
+  color:var(--accent);animation:pulse 1.1s ease-in-out infinite;
+}
+@keyframes pulse{50%{opacity:.35}}
+
+/* ---------- 页脚 ---------- */
+footer{
+  position:relative;z-index:1;
+  margin-left:var(--nav-w);
+  border-top:1px solid var(--border);
+  padding:40px clamp(24px,4.5vw,72px) 56px;
+  display:flex;flex-wrap:wrap;gap:26px;justify-content:space-between;align-items:flex-end;
+}
+footer .fine{font-size:12.5px;color:var(--muted);max-width:34em;line-height:2}
+footer a{color:var(--accent);text-decoration:none;font-family:var(--font-mono);font-size:12.5px}
+footer a:hover{border-bottom:1px solid var(--accent)}
+
+/* ---------- 响应式 ---------- */
+@media(max-width:900px){
+  aside{display:none}
+  main,footer{margin-left:0}
+}
+@media(prefers-reduced-motion:reduce){
+  .rain,.rain2{animation:none}
+}
+</style>
+</head>
+<body>
+
+<div class="rain" aria-hidden="true"></div>
+<div class="rain2" aria-hidden="true"></div>
+
+<aside>
+  <div class="brand"><span>DOCUMENTATION</span><b>Mil Recorder</b></div>
+  <nav id="nav">
+    <a href="#/intro" data-page="intro">简介</a>
+    <a href="#/usage" data-page="usage">使用方式</a>
+    <a href="#/chart-standard" data-page="chart-standard">谱面包规范</a>
+    <a href="#/reveal-format" data-page="reveal-format">解锁演出格式</a>
+    <a href="#/format-fmt2" data-page="format-fmt2">谱面格式 · fmt 2</a>
+    <a href="#/format-devjson" data-page="format-devjson" class="sub">格式化谱面(devjson)</a>
+    <a href="#/format-rem" data-page="format-rem" class="sub">REM 格式</a>
+    <a href="#/dumpmil" data-page="dumpmil">参数导出(dumpmil)</a>
+    <a href="#/build" data-page="build">构建指南</a>
+  </nav>
+  <a class="f-github" href="https://github.com/Maturing-Etern/Mil-Recorder" target="_blank" rel="noopener">github.com/Maturing-Etern/<br>Mil-Recorder</a>
+</aside>
+
+<main>
+  <div class="content" id="content"></div>
+</main>
+
+<footer>
+  <div class="fine">
+    Mil Recorder · 非官方粉丝工具,为爱发电。<br>
+    Milthm © 森零制作组 · 本工具与官方无关,请支持正版《Milthm》。
+  </div>
+  <a href="https://github.com/Maturing-Etern/Mil-Recorder" target="_blank" rel="noopener">github.com/Maturing-Etern/Mil-Recorder</a>
+</footer>
+
+<div class="loader" id="loader"><span>LOADING</span></div>
+
+<script>
+const content = document.getElementById('content');
+const loader  = document.getElementById('loader');
+const links   = [...document.querySelectorAll('#nav a')];
+
+marked.setOptions({ gfm: true, breaks: false });
+
+function render(md){
+  content.innerHTML = marked.parse(md);
+  // 标题挂 id(md 内锚点用)
+  content.querySelectorAll('h1,h2,h3,h4').forEach(h => {
+    if (!h.id) h.id = h.textContent.trim();
+  });
+  // md 相互链接:<a href="xxx.md#anchor"> → 站内切换
+  content.querySelectorAll('a[href]').forEach(a => {
+    const href = a.getAttribute('href');
+    const m = href.match(/^([\w.-]+\.md)([#].*)?$/);
+    if (m) {
+      const page = m[1].replace(/\.md$/, '');
+      const anchor = m[2] ? decodeURIComponent(m[2].slice(1)) : '';
+      a.href = '#/' + page + (anchor ? '/' + anchor : '');
+      a.dataset.page = page;
+      a.dataset.anchor = anchor;
+    }
+  });
+}
+
+async function load(page, anchor){
+  loader.classList.add('on');
+  try{
+    const res = await fetch('md/' + page + '.md');
+    if (!res.ok) throw new Error(res.status);
+    render(await res.text());
+    links.forEach(a => a.classList.toggle('in', a.dataset.page === page));
+    window.scrollTo(0, 0);
+    if (anchor) {
+      const el = document.getElementById(anchor);
+      if (el) el.scrollIntoView();
+    }
+  }catch(e){
+    content.innerHTML = '<h1>加载失败</h1><p>无法读取 md/' + page +
+      '.md — 请通过 HTTP 服务访问(如 <code>python -m http.server</code>),直接双击打开 file:// 会被浏览器拦截 fetch。</p>';
+  }
+  loader.classList.remove('on');
+}
+
+function route(){
+  const m = location.hash.match(/^#\/([\w.-]+)(?:\/(.+))?$/);
+  const page = m ? m[1] : 'intro';
+  const anchor = m && m[2] ? decodeURIComponent(m[2]) : '';
+  if (!links.some(a => a.dataset.page === page)) { location.hash = '#/intro'; return; }
+  load(page, anchor);
+}
+
+// 内容区点击(md 链接已在 render 时改写为 hash 路由,这里兜底处理锚点跳转)
+window.addEventListener('hashchange', route);
+route();
+</script>
+</body>
+</html>
