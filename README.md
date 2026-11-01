@@ -3,7 +3,7 @@
 基于 [easy-phi](https://github.com/qaqFei/easy-phi) 的 Milthm 谱面渲染与视频录制工具：实时预览、离屏逐帧录制、解锁演出还原与谱面参数导出。
 
 - 📖 **完整文档**：[docs/](docs/src/README.md)（使用方式 / 谱面包规范 / 参数导出 / 构建指南）
-- ⬇️ **下载**：[Releases](https://github.com/Maturing-Etern/Mil-Recorder/releases)
+- 🔑 **获取**：申请审核通过后发放，或按[构建指南](docs/src/build.md)自行编译
 
 ## 功能
 
@@ -34,7 +34,7 @@ mil-recorder.exe --screenshot "chart.json" 1920 1080 frame.bmp 12.5
 | 分册 | 内容 |
 |------|------|
 | [简介与导航](docs/src/README.md) | 文档总览 |
-| [使用方式](docs/src/usage.md) | 下载安装、GUI 界面、命令行参数全表、FAQ |
+| [使用方式](docs/src/usage.md) | 获取方式、GUI 界面、命令行参数全表、FAQ |
 | [谱面包规范](docs/src/chart-standard.md) | zip 三件套识别规则、meta.json、谱面 meta 与难度显示 |
 | [解锁演出格式](docs/src/reveal-format.md) | `reveal` 段格式（mil-reveal-1） |
 | [参数导出格式](docs/src/dumpmil.md) | `--dumpmil` 输出行逐字段说明与对拍口径 |

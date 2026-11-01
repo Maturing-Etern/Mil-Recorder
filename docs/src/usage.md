@@ -1,11 +1,11 @@
 # 使用方式
 
-## 下载
+## 获取
 
-前往 [Releases](https://github.com/Maturing-Etern/Mil-Recorder/releases) 页面：
+程序不提供公开下载，获取方式二选一：
 
-- **正式版**：下载 `mil-recorder.exe`（绿色单文件）或 `MilRecorder_Setup.exe`（安装包）。每个版本附带更新说明。
-- **开发版**：仓库 Actions 构建产物，功能最新但未经稳定验证。
+- **申请审核**：提交使用申请，审核通过后获取程序文件（`mil-recorder.exe` 或 `MilRecorder_Setup.exe` 安装包）。
+- **自行编译**：按[构建指南](build.md)从源码构建，编译产物为绿色单文件 `mil-recorder.exe`。
 
 系统要求：Windows 10/11 x64。
 
