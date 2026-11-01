@@ -30,6 +30,7 @@
   --ease:cubic-bezier(.16,1,.3,1);
   --dur:320ms;
   --nav-w:248px;
+  --toc-w:236px;
 }
 *{margin:0;padding:0;box-sizing:border-box}
 html{scroll-behavior:smooth}
@@ -109,6 +110,31 @@ aside .f-github{
   border-top:1px solid var(--border);
 }
 aside .f-github:hover{color:var(--accent)}
+
+/* ---------- 本页目录(右侧) ---------- */
+.toc{
+  position:fixed;top:0;right:0;bottom:0;width:var(--toc-w);z-index:9;
+  padding:34px 18px 48px 10px;
+  overflow-y:auto;
+  display:none;
+}
+.toc.on{display:block}
+.toc-title{
+  font-family:var(--font-mono);font-size:10.5px;letter-spacing:.26em;
+  color:var(--accent);margin:0 0 12px 13px;
+}
+.toc a{
+  display:block;
+  color:var(--muted);text-decoration:none;
+  font-size:12.5px;line-height:1.5;
+  padding:4px 0 4px 13px;
+  border-left:1px solid var(--border);
+  transition:color var(--dur) var(--ease),border-color var(--dur) var(--ease);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+.toc a.l3{padding-left:30px;font-size:11.5px;opacity:.85}
+.toc a:hover{color:var(--text)}
+.toc a.in{color:var(--accent);border-left-color:var(--accent);opacity:1}
 
 /* ---------- 主列 ---------- */
 main{
@@ -212,6 +238,9 @@ footer a{color:var(--accent);text-decoration:none;font-family:var(--font-mono);f
 footer a:hover{border-bottom:1px solid var(--accent)}
 
 /* ---------- 响应式 ---------- */
+@media(min-width:1281px){
+  main,footer{margin-right:var(--toc-w)}
+}
 @media(max-width:900px){
   aside{display:none}
   main,footer{margin-left:0}
@@ -246,6 +275,11 @@ footer a:hover{border-bottom:1px solid var(--accent)}
   <div class="content" id="content"></div>
 </main>
 
+<nav class="toc" id="toc" aria-label="本页目录">
+  <div class="toc-title">ON THIS PAGE</div>
+  <div id="tocList"></div>
+</nav>
+
 <footer>
   <div class="fine">
     Mil Recorder · 非官方粉丝工具,为爱发电。<br>
@@ -260,6 +294,9 @@ footer a:hover{border-bottom:1px solid var(--accent)}
 const content = document.getElementById('content');
 const loader  = document.getElementById('loader');
 const links   = [...document.querySelectorAll('#nav a')];
+const toc     = document.getElementById('toc');
+const tocList = document.getElementById('tocList');
+let loadedPage = null;
 
 marked.setOptions({ gfm: true, breaks: false });
 
@@ -283,19 +320,63 @@ function render(md){
   });
 }
 
+// ---------- 本页目录 ----------
+let spyRAF = 0;
+function buildToc(page){
+  const hs = [...content.querySelectorAll('h2,h3')];
+  tocList.innerHTML = '';
+  if (hs.length < 2) { toc.classList.remove('on'); return; }
+  hs.forEach(h => {
+    const a = document.createElement('a');
+    a.textContent = h.textContent;
+    a.href = '#/' + page + '/' + encodeURIComponent(h.id);
+    a.className = h.tagName === 'H3' ? 'l3' : 'l2';
+    a.dataset.target = h.id;
+    tocList.appendChild(a);
+  });
+  toc.classList.add('on');
+  spy();
+}
+function spy(){
+  const items = [...tocList.children];
+  if (!items.length) return;
+  let cur = items[0];
+  for (const a of items) {
+    const el = document.getElementById(a.dataset.target);
+    if (el && el.getBoundingClientRect().top <= 120) cur = a;
+  }
+  // 页面底部时点亮最后一项
+  if (window.innerHeight + window.scrollY >= document.body.scrollHeight - 40) cur = items[items.length - 1];
+  items.forEach(a => a.classList.toggle('in', a === cur));
+}
+window.addEventListener('scroll', () => {
+  if (spyRAF) return;
+  spyRAF = requestAnimationFrame(() => { spyRAF = 0; spy(); });
+}, { passive: true });
+
+function scrollToAnchor(anchor){
+  if (anchor) {
+    const el = document.getElementById(anchor);
+    if (el) { el.scrollIntoView(); return; }
+  }
+  window.scrollTo(0, 0);
+}
+
 async function load(page, anchor){
+  // 同页切换(点目录/锚点)不重拉 md
+  if (page === loadedPage) { scrollToAnchor(anchor); spy(); return; }
   loader.classList.add('on');
   try{
     const res = await fetch('md/' + page + '.md');
     if (!res.ok) throw new Error(res.status);
     render(await res.text());
+    loadedPage = page;
     links.forEach(a => a.classList.toggle('in', a.dataset.page === page));
-    window.scrollTo(0, 0);
-    if (anchor) {
-      const el = document.getElementById(anchor);
-      if (el) el.scrollIntoView();
-    }
+    buildToc(page);
+    scrollToAnchor(anchor);
   }catch(e){
+    loadedPage = null;
+    toc.classList.remove('on');
     content.innerHTML = '<h1>加载失败</h1><p>无法读取 md/' + page +
       '.md — 请通过 HTTP 服务访问(如 <code>python -m http.server</code>),直接双击打开 file:// 会被浏览器拦截 fetch。</p>';
   }
