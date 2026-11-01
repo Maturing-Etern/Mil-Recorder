@@ -11,17 +11,16 @@
 
 ## GUI
 
-双击 `mil-recorder.exe` 打开主界面（窗口标题 Open RPE Recorder）。
+双击 `mil-recorder.exe` 打开主界面。
 
 ### 谱面选择
 
 | 控件 | 说明 |
 |------|------|
-| 谱面根目录 | 选择谱面所在目录（storyboard 贴图也从此目录寻找） |
+| 谱面根目录 | 选择谱面所在目录 |
 | 谱面文件 | `.json`（devjson / REM）或 `.js`（官方 MilizeBeatmap） |
 | 曲绘文件 | `.png` / `.jpg` / `.jpeg` |
 | 音频文件 | `.mp3` / `.wav` / `.ogg` / `.flac` / `.m4a` / `.aac` |
-| 从 info.txt ... | 一次性导入 Rainy Playground（RPE）工程的 `info.txt`，自动填三件套路径 |
 
 > 谱面包 `.zip` 无需逐项填写，见下文命令行或直接拖入后按提示操作；规范见[谱面包规范](chart-standard.md)。
 

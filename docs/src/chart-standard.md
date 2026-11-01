@@ -21,7 +21,6 @@ MyChart.zip
 | 谱面 | 第一个 `.js` / `.json`；若存在 `chart.json` 则**优先**；`meta.json`、`shaders.json` 永远不会被当成谱面 |
 | 音频 | `.wav` / `.mp3` / `.ogg` / `.flac` / `.m4a` / `.aac` 中**取最大**的文件；`hit*` / `drag*` / `tap*` 开头的打击音效文件会被排除 |
 | 曲绘 | `.png` / `.jpg` / `.jpeg` 中取最大的文件 |
-| storyboard 贴图根目录 | 谱面文件实际所在目录（zip 根在上一层时也能正确定位） |
 
 识别失败的报错格式：`zip 中找不到谱面文件(.js/.json)`、`zip 中找不到音频文件(.wav/.mp3/.ogg/...)`。
 

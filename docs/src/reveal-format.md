@@ -33,20 +33,20 @@
 | fmt | string | ✅ | 恒为 `"mil-reveal-1"`（校验用） |
 | video | string | ✅ | 解锁演出视频，包内相对路径。推荐 **H.264 + yuv420p** mp4（软解支持 h264/hevc/av1/vp9，非 420 平面格式会黑屏退回） |
 | ui.countdown | bool | ❌ | 右下角剩余时间，默认 `true`（本家 CountDown：anchor(1,0) pos(-122,101)，显示音乐剩余 `Length-Time`） |
-| timing.musicAwaitTime | number | ❌ | 本家"音乐 !IsPlaying 累计 3s 兜底进谱"，默认 `3.0`（本家恒 3.0；CLI 导出时间轴不使用） |
+| timing.musicAwaitTime | number | ❌ | 本家"音乐未播出累计 3s 兜底进谱"，默认 `3.0`（本家恒 3.0；CLI 导出时间轴不使用） |
 
-视频音频轨会被忽略——**演出背景音乐 = 谱面 BGM**（本家：PV 页用 JuceAudioSourcePlayer 单独放整曲，
-与视频 isPrepared 同帧起播）。
+视频音频轨会被忽略——**演出背景音乐 = 谱面 BGM**（本家 PV 页用独立的整曲音频源播放，
+与视频就绪同帧起播）。
 
-## 本家行为（libil2cpp 反汇编 2026-10-22 实锤）
+## 本家行为参考
 
-`Milthm.PV.PVController`（Update 0x42cf074 / loopPointReached 0x42ceebc / StartGame 0x42cef58）：
+对本家解锁演出实测观察到的行为，渲染器按此对齐：
 
-1. 视频 `isPrepared` → `ready=true` → `Music.Play()` **同帧起播**
-2. 每帧 `CountDown.text = Music.Length - Music.Time`
-3. 视频播完（loopPointReached）→ 只置 `videoDone=true`，**音乐继续放**
-4. 音乐 `!IsPlaying` 且未 loaded → `StartGame()`（`Cutscene.Run(BlackLoading)` → `LaunchGameplay` + `SndPlayer.Play(-1,3)` 启动音）
-5. 兜底：音乐从未播出（`!IsPlaying` 累计）≥3.0s → `musicAwaitTime=0` + 置位后同帧进谱
+1. 视频就绪后音乐**同帧起播**
+2. 右下角倒计时每帧刷新为音乐剩余时长
+3. 视频播完后**音乐继续放**（不会因视频结束而提前进谱）
+4. 音乐整首播完后进入黑场过渡，随后载入谱面（带启动音效）
+5. 兜底：音乐因故未播出累计 ≥3s 时跳过等待直接进谱
 
 即：**视频放完 ≠ 进谱面，音乐整首放完才进**。
 
