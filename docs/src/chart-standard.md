@@ -55,6 +55,7 @@ MyChart.zip
 |------|------|------|
 | devjson（format 2） | `.json` | [devjson 字段分析](format-devjson.md) |
 | REM | `.json` | [REM 字段分析](format-rem.md) |
-| 官方 JS 谱面 | `.js` | [官方 JS 字段分析](format-ingame-js.md) |
+| 同人制谱器 fmt 2 | `.json`（根键 `fmt: 2`） | [fmt 2 字段分析](format-fmt2.md) |
+| 官方 JS 谱面 | `.js` | 同上（MilizeBeatmap，内嵌 quickjs 执行后直接构造） |
 
 三种格式共享同一条渲染链路；事件与判定线行为均以 Milthm 游戏本体为对齐基准。

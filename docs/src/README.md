@@ -6,7 +6,7 @@
 |------|------|
 | [使用方式](usage.md) | 获取方式、GUI 界面说明、命令行参数全表 |
 | [谱面包规范](chart-standard.md) | zip 谱面包结构、meta.json 字段、谱面文件 meta 与难度显示 |
-| [谱面格式分析](format-devjson.md) | devjson / REM / 官方 JS 三种谱面的逐字段分析（坐标系、事件表、时间换算） |
+| [谱面格式分析](format-fmt2.md) | fmt 2 / 同人制谱器、devjson、REM 三种谱面的逐字段分析（坐标系、事件表、时间换算） |
 | [解锁演出格式](reveal-format.md) | `meta.json` 的 `reveal` 段：自制谱进谱前 PV 演出（mil-reveal-1） |
 | [参数导出格式](dumpmil.md) | `--dumpmil` 输出行逐字段说明与对拍口径 |
 | [构建指南](build.md) | 前置依赖、一键编译、grain 全链构建、安装包与发版 |
@@ -27,5 +27,6 @@ mil-recorder.exe --record "谱面包.zip" 1920 1080 60 out.mp4
 |------|------|
 | devjson（format 2） | Milthm 格式化谱面 JSON |
 | REM | Rain Editor Mobile JSON，含 v1.5 新字段（`bpmChanges` 三元组节拍、`parentId` 父子轨道） |
+| 同人制谱器 fmt 2 | 社区制谱器导出 JSON（`fmt: 2`），详见[格式分析](format-fmt2.md) |
 | 官方 JS 谱面 | MilizeBeatmap，经内置 quickjs 执行 |
 | 谱面包 zip | 自动识别谱面 / 音频 / 曲绘三件套，详见[谱面包规范](chart-standard.md) |

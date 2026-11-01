@@ -111,4 +111,4 @@ devjson 的时间基准是**秒**而非拍——`bpms[i].start` 直接是秒，�
 
 ### 流速语义
 
-devjson 的音符滚动为 **Override（覆盖）语义**：音符最终流速由 `Speed`（key 12）事件直接决定，`speedUnit` 取 108（官方 ingame JS 导出为 Multiply 语义、speedUnit=120，见 [官方 JS 谱面](format-ingame-js.md)）。速度事件段重叠 / 不连续时的规范化以后段优先。
+devjson 的音符滚动为 **Override（覆盖）语义**：音符最终流速由 `Speed`（key 12）事件直接决定，`speedUnit` 取 108（fmt 2 / 同人制谱器格式为 Multiply 语义、speedUnit=120，见 [fmt 2 格式](format-fmt2.md)）。速度事件段重叠 / 不连续时的规范化以后段优先。
