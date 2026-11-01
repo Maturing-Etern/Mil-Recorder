@@ -4936,7 +4936,7 @@ void main() {
             
             Transform2D lineTransform {};
             lineTransform.translate(linePosition);
-            lineTransform.rotateDegrees(90.0 - lineRotation);
+            lineTransform.rotateDegrees(lineRotation - 90.0);
             lineTransform.scale(screenSize / meta.worldViewport.abs());
             lineTransform.scale(lineSize);
             lineTransform.scale(1.0, -1.0);
@@ -4995,12 +4995,11 @@ void main() {
 
             info.headPosition = lineTransform.transformPoint(noteRelPositionHead);
             info.tailPosition = lineTransform.transformPoint(noteRelPositionTail);
-            // 精灵角度(2026-10-21 对齐 milplay 权威 port.js/base.js):
-            //   音符贴图 texRot = -(LR+NR), 速度向量 = -LR(flow<0 再+180)。
-            //   10-14 的 180+LR+NR 是对 RPU 的过度对齐(当时 RPU 对照实为 dumpmil 透传比对,
-            //   贴图公式从未被独立验证); 竖直 LR=90 时 -90≡270 与旧值一致, 竖直渲染不变。
-            info.textureRotation = -lineRotation - noteRotation;
-            info.speedVectorRotation = -lineRotation;
+            // 精灵角度(2026-10-30 随旋转口径翻转重推): 线轴屏幕角 = LR(本家真值 θ=LR-90 已 8/8 实证),
+            //   音符长轴须与线轴平行, 且判定端(头帽)朝向线头 -> texRot = LR+NR+180(竖直 LR=90 时 ≡-90 与旧值一致);
+            //   milplay 的 -(LR+NR) 是镜像口径, 已弃。速度向量 = 流向 = LR(flow<0 再+180)。
+            info.textureRotation = lineRotation + noteRotation + 180.0;
+            info.speedVectorRotation = lineRotation;
             if (finalFlowSpeed < 0) info.speedVectorRotation += 180.0;
             info.scale = Vec2(noteLineScale * noteSize);
             info.color = noteColor.applyAlpha(lineWholeAlpha * noteAlpha);
@@ -5715,8 +5714,7 @@ void main() {
         float64 posXBias = -750.0 * (1080.0 / 900.0);
         float64 posYScale = -1080.0 / 900.0;
         float64 posYBias = 540.0;
-        // 旋转：REM 0 = 朝上、顺时针为正；Milthm 0 = 朝右、默认 90 → Milthm = 90 - REM
-        float64 rotScale = -1.0;
+        float64 rotScale = 1.0;
         float64 rotBias = 90.0;
         // 尺寸 / 透明度
         float64 sizeScale = 1.0;
@@ -6377,13 +6375,10 @@ void main() {
                 auto lineWidth = lineHeadBase * 0.096774;
                 frame.addObject(frame.cache.trackObjects, MilCalculatedFrame::CalculatedLineBody {
                     .origin = linePosition,
-                    // 线体方向对齐 milplay drawLineState(ang=-LR, 从判定圈延伸):
-                    // GL 端 T·R(rotation)·矩形(-x 区间延伸), R(ρ)·(-1,0)=(-cosρ,-sinρ) 要等于
-                    // milplay 的 (cos(-LR),sin(-LR)) ⇒ ρ=180-LR。LR=90 时恒等 90, 竖直不变。
                     .position = { -(connectRadius + config.screenSize.y * 2.5), -lineWidth / 2 },
                     .size = { config.screenSize.y * 2.5, lineWidth },
                     .scale = { lineSize, lineSize },
-                    .rotation = 180.0 - lineRotation,
+                    .rotation = lineRotation,
                     .color = lineColor.applyAlpha(lineBodyAlpha)
                 }, screenArea);
             }
