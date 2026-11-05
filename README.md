@@ -46,4 +46,6 @@ mil-recorder.exe --screenshot "chart.json" 1920 1080 frame.bmp 12.5
 
 本项目基于 [easy-phi](https://github.com/qaqFei/easy-phi)（MIT）构建。
 
-`files/resources/` 下的资源文件版权归原作者所有，如有侵权请联系删除。
+`files/resources/` 下的资源文件版权归原作者所有，如有侵权请联系删除
+
+本项目仅语法检查使用AI，请尊重他人的劳动成果
