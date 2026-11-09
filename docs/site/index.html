@@ -9,6 +9,7 @@
 <link rel="preconnect" href="https://gstatic.loli.net" crossorigin>
 <link href="https://fonts.loli.net/css2?family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <script src="./marked.min.js"></script>
+<script src="./html2canvas.min.js"></script>
 <style>
 /* Milthm 游戏 UI 字体(ChillRoundF,与游戏本体一致) */
 @font-face{
@@ -312,6 +313,19 @@ main{
   border:1px solid var(--border);border-radius:3px;padding:1px 5px;
 }
 
+/* ---------- 轻提示 ---------- */
+.toast{
+  position:fixed;bottom:32px;left:50%;z-index:70;
+  transform:translateX(-50%) translateY(10px);
+  background:var(--surface);
+  border:1px solid rgba(168,124,255,.35);border-radius:8px;
+  color:var(--text);font-size:13px;
+  padding:10px 22px;
+  opacity:0;pointer-events:none;
+  transition:opacity .25s ease,transform .25s ease;
+}
+.toast.on{opacity:1;transform:translateX(-50%) translateY(0)}
+
 /* ---------- 加载态 ---------- */
 .loader{
   position:fixed;inset:0;z-index:50;display:none;
@@ -389,6 +403,10 @@ footer a:hover{border-bottom:1px solid var(--accent)}
   <button class="tb-btn" id="printBtn" aria-label="打印全部页面">
     <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6V2.5h8V6M4 11H2.5V6h11V11H12M4 9.5h8V14H4z"/></svg>
     <span>打印/PDF</span>
+  </button>
+  <button class="tb-btn" id="shotBtn" aria-label="生成当前页图片">
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M1.5 5.5A1.5 1.5 0 0 1 3 4h1.2l1-1.6h5.6l1 1.6H13a1.5 1.5 0 0 1 1.5 1.5v7A1.5 1.5 0 0 1 13 14H3a1.5 1.5 0 0 1-1.5-1.5z"/><circle cx="8" cy="8.8" r="2.6"/></svg>
+    <span>生成图片</span>
   </button>
   <a class="tb-github" href="https://github.com/Maturing-Etern/Mil-Recorder" target="_blank" rel="noopener">GitHub</a>
 </header>
@@ -660,6 +678,49 @@ searchInput.addEventListener('keydown', e => {
 window.addEventListener('keydown', e => {
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); openSearch(); }
   else if (e.key === 'Escape') closeSearch();
+});
+
+// ---------- 生成图片(当前页 → PNG 长图,同插件帮助图的 HTML 截图机制) ----------
+let toastTimer = 0;
+function toast(msg){
+  let t = document.getElementById('toast');
+  if (!t) { t = document.createElement('div'); t.id = 'toast'; document.body.appendChild(t); }
+  t.textContent = msg;
+  t.classList.add('on');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove('on'), 2600);
+}
+
+document.getElementById('shotBtn').addEventListener('click', async () => {
+  if (!window.html2canvas) { toast('html2canvas 未加载'); return; }
+  toast('正在生成图片…');
+  const page = loadedPage || 'intro';
+  const card = document.createElement('div');
+  card.style.cssText = 'position:fixed;left:-9999px;top:0;width:900px;background:#050508;padding:44px 56px 52px';
+  const head = document.createElement('div');
+  head.style.cssText = 'font-family:var(--font-mono);color:#A87CFF;font-size:12px;letter-spacing:.3em;margin-bottom:8px';
+  head.textContent = 'MIL RECORDER · DOCS';
+  const title = document.createElement('div');
+  title.style.cssText = 'font-family:var(--font-display);color:#f2f0f7;font-size:30px;font-weight:700;margin-bottom:26px;border-bottom:1px solid rgba(168,124,255,.3);padding-bottom:14px';
+  title.textContent = pageTitle(page);
+  const body = content.cloneNode(true);
+  body.style.cssText = 'width:788px;color:#f2f0f7';
+  card.appendChild(head); card.appendChild(title); card.appendChild(body);
+  document.body.appendChild(card);
+  try{
+    const canvas = await html2canvas(card, { backgroundColor: '#050508', scale: 2, useCORS: true, logging: false });
+    canvas.toBlob(b => {
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(b);
+      a.download = 'Mil-Recorder-docs-' + page + '.png';
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+      toast('已生成 PNG(开始下载)');
+    }, 'image/png');
+  }catch(e){
+    toast('生成失败:' + e.message);
+  }
+  card.remove();
 });
 
 // ---------- 打印(全部页面合为一个视图) ----------
