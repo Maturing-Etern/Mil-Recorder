@@ -12,7 +12,7 @@ bc = build.BuildConfig(
     macros=["APP_TYPE_MIL_PLAYER"],
     externals=[local_repo],
 )
-fs = build.generate_final_source(repo, data_dir, app_dir, bc)
+fs = build.generate_final_source(cfg, app_dir, bc)
 out = data_dir / "build" / "source.cpp"
 out.write_text(fs.code, encoding="utf-8")
 print("code len:", len(fs.code))

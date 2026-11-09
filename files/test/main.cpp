@@ -347,6 +347,10 @@ namespace test_main {
                 e.valueZone = chart.storyboardAssets.requestColorPair(parseMilColor(a.fvStr), parseMilColor(a.tvStr));
             } else {
                 e.valueZone = { a.fv, a.tv };
+                if (e.type == EnumMilEventType::Rotation) {
+                    e.valueZone.x = 180.0 - e.valueZone.x;
+                    e.valueZone.y = 180.0 - e.valueZone.y;
+                }
             }
             if (a.press != 0) {
                 e.easingFuncContext = (void*)EaseSet::Milthm::pack(a.ease, a.press);
@@ -1371,6 +1375,40 @@ namespace test_main {
         return r;
     }
 
+    // [CLI] 裸谱面曲绘兜底: 无 zip/meta.json 时, 在谱面目录与上级 artwork/ 目录找最大图片
+    // 路径必须以 UTF-8(char8_t) 构造, 否则 fs 窄字符按 ACP 转换, 非 ASCII 目录(如曲库日文名)全部 exists()=false
+    inline std::string findIllustionFallback(const std::string& chartDir) {
+        namespace fs = std::filesystem;
+        std::string best; uint64 bestSize = 0;
+        auto scan = [&](const fs::path& dir) {
+            std::error_code ec;
+            for (fs::recursive_directory_iterator it(dir, ec), end; it != end && !ec; it.increment(ec)) {
+                if (!it->is_regular_file(ec)) continue;
+                std::u8string p8 = it->path().u8string();
+                std::string low(p8.begin(), p8.end());
+                for (auto& c : low) c = (char)std::tolower((unsigned char)c);
+                if (low.find("storyboard") != std::string::npos) continue;   // 故事板贴图不当曲绘
+                std::u8string ext8 = it->path().extension().u8string();
+                std::string ext(ext8.begin(), ext8.end());
+                for (auto& c : ext) c = (char)std::tolower((unsigned char)c);
+                if (ext != ".png" && ext != ".jpg" && ext != ".jpeg") continue;
+                uint64 sz = it->file_size(ec);
+                if (!ec && sz > bestSize) { bestSize = sz; best.assign(p8.begin(), p8.end()); }
+            }
+        };
+        fs::path root(reinterpret_cast<const char8_t*>(chartDir.c_str()));
+        scan(root);
+        {
+            fs::path p = root;
+            std::error_code ec;
+            for (int i = 0; i < 3 && best.empty() && !p.empty(); i++, p = p.parent_path()) {
+                fs::path artDir = p / "artwork";
+                if (fs::exists(artDir, ec)) scan(artDir);
+            }
+        }
+        return best;
+    }
+
     // [CLI zip] 谱面 zip 直接播放: 解压到临时目录, 找谱面+音频+曲绘, 预览播放
     void runMilZipPlay(const std::string& zipPath) {
         try {
@@ -1442,6 +1480,7 @@ namespace test_main {
                     } catch (...) {}
                 }
             }
+            if (imagePath.empty()) imagePath = findIllustionFallback(chartDir);   // [CLI] 曲绘兜底
 
             Settings settings {};
             settings.fromRegistry();
@@ -1632,6 +1671,7 @@ namespace test_main {
                     } catch (...) {}
                 }
             }
+            if (imagePath.empty()) imagePath = findIllustionFallback(chartDir);   // [CLI] 曲绘兜底
             if (!imagePath.empty()) {
                 try { backendWin.renderer->loadIllustion(imagePath); }
                 catch (const std::exception& e) { std::fprintf(stderr, "[dbg screenshot] jacket decode failed (%s), fallback to mask\n", e.what()); }

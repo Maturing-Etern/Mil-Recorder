@@ -4146,7 +4146,9 @@ void main() {
                     { EnumMilEventType::FlowSpeed, 1 },
                 } },
                 { EnumMilObjectType::Storyboard, {
-                    { EnumMilEventType::Transparency, 1 },
+                    // [默认值] 故事板 Transparency 默认 0(无事件精灵不可见);
+                    // 首事件之前 = 首事件开始值
+                    { EnumMilEventType::Transparency, 0 },
                     { EnumMilEventType::Size, 1 },
                     { EnumMilEventType::StoryBoardWidth, 1 },
                     { EnumMilEventType::StoryBoardHeight, 1 },
@@ -4960,16 +4962,19 @@ void main() {
                 noteFloorPosition.x = 0.0;
             }
             
-            // [VisibleArea 对齐 RPU] RainPlayerUnity GameMain: if (noteFp > MilToCanvasY(lineVisArea)) noteColor.a = 0。
-            // 旧实现把 setHidden() 放在 info.color 赋值之前, 随后 info.color = noteColor.applyAlpha(...)
-            // 把 a=0 覆盖回 1.0 → 裁剪是死代码。RPU 判定用同一 fp 差值(mil 单位, canvas 缩放相消),
-            // 这里改为先记 flag, 在 color 最终赋值之后生效。
-            bool visAreaCull = noteFloorPosition.x > lineVisibleArea;
-
             if (animator.has(note, EnumMilEventType::PositionY)) {
                 noteFloorPosition -= noteFloorPosition.x;
                 noteFloorPosition += animator.get(note, time, EnumMilEventType::PositionY);
             }
+
+            // [VisibleArea 对齐 RPU] RainPlayerUnity GameMain: if (noteFp > MilToCanvasY(lineVisArea)) noteColor.a = 0。
+            // 旧实现把 setHidden() 放在 info.color 赋值之前, 随后 info.color = noteColor.applyAlpha(...)
+            // 把 a=0 覆盖回 1.0 → 裁剪是死代码。RPU 判定用同一 fp 差值(mil 单位, canvas 缩放相消),
+            // 这里改为先记 flag, 在 color 最终赋值之后生效。
+            // [2026-11-05 修] 裁剪取值必须在 PositionY 覆盖之后: 逐 note 编排(phinity Target=noteId 事件)的
+            //   绘制偏移 = 脚本 PositionY, 若用覆盖前的接近距离(rawfp > visArea)
+            //   会把屏内编排音符整批误裁(a=0) → RPU 的 noteFp 即绘制用 fp。
+            bool visAreaCull = noteFloorPosition.x > lineVisibleArea;
 
             Vec2 noteBasePosition = {
                 animator.get(note, time, EnumMilEventType::RelativeX) + animator.get(note, time, EnumMilEventType::PositionX),
@@ -6373,10 +6378,20 @@ void main() {
             if (lineBodyAlpha > 0.0) {
                 auto connectRadius = config.lineHeadConnectPoint * lineHeadBase * config.lineHeadScale;
                 auto lineWidth = lineHeadBase * 0.096774;
+                static const float64 milBodyLenMult = [] {
+                    auto s = std::getenv("MIL_LINE_BODY_LEN");
+                    float64 v = s ? std::atof(s) : 5.0;
+                    return v > 0.0 ? v : 5.0;
+                }();
+                static const bool milBodyLenPrinted = [] {
+                    fprintf(stderr, "[MilLineBody] length = screenHeight * %.2f (env MIL_LINE_BODY_LEN, default 5.0 = 2x original)\n", milBodyLenMult);
+                    return true;
+                }();
+                auto milBodyLen = config.screenSize.y * milBodyLenMult;
                 frame.addObject(frame.cache.trackObjects, MilCalculatedFrame::CalculatedLineBody {
                     .origin = linePosition,
-                    .position = { -(connectRadius + config.screenSize.y * 2.5), -lineWidth / 2 },
-                    .size = { config.screenSize.y * 2.5, lineWidth },
+                    .position = { -(connectRadius + milBodyLen), -lineWidth / 2 },
+                    .size = { milBodyLen, lineWidth },
                     .scale = { lineSize, lineSize },
                     .rotation = lineRotation,
                     .color = lineColor.applyAlpha(lineBodyAlpha)
@@ -8070,14 +8085,18 @@ void main() {
                 .texture = sharedComp.illustionTexture.get()
             });
 
+            // [Storyboard][层序] illustration -> sb Background -> 黑 mask -> line/音符 -> sb Normal -> sb Foreground
+            // Background 层画在黑 mask 之下; Normal 层画在 mask 之上、线/音符之下
+            drawMilStoryboards(cvs, t, EnumMilStoryboardLayer::Background);
+
             cvs.drawRect({
                 .position = { calculatedFrame.backgroundRect.x, calculatedFrame.backgroundRect.y },
                 .size = { calculatedFrame.backgroundRect.w, calculatedFrame.backgroundRect.h },
                 .texture = backgroundMask.get()
             });
 
-            // [Storyboard] Background 层：背景之上、轨道之下
-            drawMilStoryboards(cvs, t, EnumMilStoryboardLayer::Background);
+            // [Storyboard] Normal 层：线/音符之下(旧实现画在音符之上, 层序错)
+            drawMilStoryboards(cvs, t, EnumMilStoryboardLayer::Normal);
 
             for (auto& obj : calculatedFrame.objects) {
                 if (TakeOvererComponents::renderSharedObject(obj, glCtx, cvs, textManager)) {
@@ -8235,8 +8254,7 @@ void main() {
                 }
             }
 
-            // [Storyboard] Normal / Foreground 层：轨道之上、HUD 之下
-            drawMilStoryboards(cvs, t, EnumMilStoryboardLayer::Normal);
+            // [Storyboard] Foreground 层：音符之上、HUD 之下(Normal 层已前移至音符之前)
             drawMilStoryboards(cvs, t, EnumMilStoryboardLayer::Foreground);
 
             cvs.drawRect({
