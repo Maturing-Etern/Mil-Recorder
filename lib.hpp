@@ -5000,9 +5000,9 @@ void main() {
 
             info.headPosition = lineTransform.transformPoint(noteRelPositionHead);
             info.tailPosition = lineTransform.transformPoint(noteRelPositionTail);
-            // 精灵角度(2026-10-30 随旋转口径翻转重推): 线轴屏幕角 = LR(本家真值 θ=LR-90 已 8/8 实证),
-            //   音符长轴须与线轴平行, 且判定端(头帽)朝向线头 -> texRot = LR+NR+180(竖直 LR=90 时 ≡-90 与旧值一致);
-            //   milplay 的 -(LR+NR) 是镜像口径, 已弃。速度向量 = 流向 = LR(flow<0 再+180)。
+            // 精灵角度(2026-11-09 复核): 竖直线 LR=90 tap 实测 texRot=270 与游戏一致(旋转互相关在近对称
+            //   雨滴贴图上会产生假 180 度峰, 不可单独作为判据); 与 RPU 链(LR+NR+axis)差 180 为贴图基础朝向差。
+            //   速度向量 = 流向 = LR(flow<0 再+180)。
             info.textureRotation = lineRotation + noteRotation + 180.0;
             info.speedVectorRotation = lineRotation;
             if (finalFlowSpeed < 0) info.speedVectorRotation += 180.0;
@@ -7986,21 +7986,25 @@ void main() {
                     auto tex = requestStoryboardTexture(sb.data);
                     if (!tex) continue;
 
-                    // 4 角事件(默认 ±0.5) = 贴图归一化矩形; 贴图按原始像素尺寸绘制(1px = 1 世界单位)
-                    float64 lbx = chart.animator.get(sb, t, EnumMilEventType::StoryBoardLeftBottomX);
-                    float64 lby = chart.animator.get(sb, t, EnumMilEventType::StoryBoardLeftBottomY);
-                    float64 rtx = chart.animator.get(sb, t, EnumMilEventType::StoryBoardRightTopX);
-                    float64 rty = chart.animator.get(sb, t, EnumMilEventType::StoryBoardRightTopY);
+                // 4 角事件(默认 ±0.5) = 贴图归一化矩形; 贴图按原始像素尺寸绘制(1px = 1 世界单位)
+                float64 lbx = chart.animator.get(sb, t, EnumMilEventType::StoryBoardLeftBottomX);
+                float64 lby = chart.animator.get(sb, t, EnumMilEventType::StoryBoardLeftBottomY);
+                float64 rtx = chart.animator.get(sb, t, EnumMilEventType::StoryBoardRightTopX);
+                float64 rty = chart.animator.get(sb, t, EnumMilEventType::StoryBoardRightTopY);
+                // [X/Y 拉伸] key10/11 仅 storyboard bearer 有效(线/音符不消费此键);
+                //   最终尺寸 = 基准 × Size × SBWidth(x) / SBHeight(y)
+                float64 sbWidth = chart.animator.get(sb, t, EnumMilEventType::StoryBoardWidth);
+                float64 sbHeight = chart.animator.get(sb, t, EnumMilEventType::StoryBoardHeight);
 
-                    Vec2 texSize { (float64)tex->width, (float64)tex->height };
-                    Vec2 quadWorld = {
-                        std::abs(rtx - lbx) * texSize.x * size,
-                        std::abs(rty - lby) * texSize.y * size
-                    };
-                    Vec2 localOffset = {
-                        (rtx + lbx) * 0.5 * texSize.x * size,
-                        (rty + lby) * 0.5 * texSize.y * size
-                    };
+                Vec2 texSize { (float64)tex->width, (float64)tex->height };
+                Vec2 quadWorld = {
+                    std::abs(rtx - lbx) * texSize.x * size * sbWidth,
+                    std::abs(rty - lby) * texSize.y * size * sbHeight
+                };
+                Vec2 localOffset = {
+                    (rtx + lbx) * 0.5 * texSize.x * size * sbWidth,
+                    (rty + lby) * 0.5 * texSize.y * size * sbHeight
+                };
 
                     auto screenSize = calcConfig.screenSize;
                     // 世界 -> 屏幕(worldViewport.y 为负, y 轴翻转由此自动完成)

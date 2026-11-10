@@ -344,10 +344,20 @@ namespace test_main {
             e.type = MilEventTypeHelper::FromInt(a.key);
             e.timeZone = { a.fromBeat, a.toBeat };
             if (e.type == EnumMilEventType::Color) {
-                e.valueZone = chart.storyboardAssets.requestColorPair(parseMilColor(a.fvStr), parseMilColor(a.tvStr));
+                // [Color 兜底] 颜色事件值可能以数字(uint32 RGBA: r<<24|g<<16|b<<8|a)而非字符串传入,
+                //   此时 fvStr/tvStr 为空 -> parseMilColor("") 会错成白色(黑色遮罩变白)。
+                //   数字串走 parseMilColor 的 uint32 拆分分支。
+                auto parseColorArg = [&](const std::string& s, double num) {
+                    if (!s.empty()) return parseMilColor(s);
+                    return parseMilColor(std::to_string((unsigned long long)(uint64_t)(int64_t)num));
+                };
+                e.valueZone = chart.storyboardAssets.requestColorPair(parseColorArg(a.fvStr, a.fv), parseColorArg(a.tvStr, a.tv));
             } else {
                 e.valueZone = { a.fv, a.tv };
-                if (e.type == EnumMilEventType::Rotation) {
+                // [旋转口径] 仅线级(bearer=data 0)需要 180-v 重映射; note(1)/storyboard(2)
+                //   的 rotation 语义为原值直用(2026-11-09 实锤: note 级 ±10 度旋转被误翻成
+                //   170/190 度致雨滴贴图倒立; sb 小角度旋转同样被误翻)。线级翻转已由外部真值视频验证。
+                if (e.type == EnumMilEventType::Rotation && a.data == 0) {
                     e.valueZone.x = 180.0 - e.valueZone.x;
                     e.valueZone.y = 180.0 - e.valueZone.y;
                 }

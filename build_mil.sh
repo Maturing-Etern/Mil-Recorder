@@ -7,7 +7,9 @@ ROOT="E:/HugoMoveData/User/lenovo/Downloads/Milthm unpack tools/Mil-Recorder"
 SRC="E:/grain_data/build/source.cpp.patched.cpp"
 G="E:/grain_data/packages"
 
-# 编译临时文件重定向到 E 盘（避免占 C 盘 Temp）+ -pipe 减少中间文件
+# 编译临时文件重定向到 E 盘（避免占 C 盘 Temp）
+# 2026-11-09: 去掉 -pipe —— 60MB 单 TU 下 -pipe 强制中间产物驻留内存, 8GB 机器会卡死;
+#   落盘到 TMP(E 盘)换稳定性, 峰值内存显著下降
 export TMP="E:/grain_data/build/tmp" TEMP="E:/grain_data/build/tmp"
 mkdir -p "E:/grain_data/build/tmp"
 
@@ -19,7 +21,7 @@ cd "$ROOT"
 echo "windres ok"
 
 "E:/Qt/Tools/mingw1310_64/bin/g++.exe" \
-  -std=c++20 -static -O1 -Wsign-compare -Wa,-mbig-obj -pipe \
+  -std=c++20 -static -O1 -Wsign-compare -Wa,-mbig-obj \
   -include "$ROOT/milize_js/milize_js.h" \
   -I"$ROOT" \
   -I"$G/gglfw3==0/.grain/includes" \
